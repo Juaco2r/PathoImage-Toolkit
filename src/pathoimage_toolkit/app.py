@@ -189,17 +189,16 @@ _BFIO_IMPORT_ERROR = None
 _BFIO_BOOTSTRAP_WARNING = None
 
 
-def _try_import_bfio():
-    """Return ``bfio.BioReader`` and prepare Java for the Bio-Formats backend.
+def _try_import_bioio_bioformats():
+    """Return ``(BioImage, bioio_bioformats)`` prepared for VSI reading.
 
-    The import is intentionally split into stages.  Earlier builds swallowed every
-    exception and then reported that ``bfio`` was not installed, even when the real
-    problem was a frozen/PyInstaller dependency, Java bootstrap, or missing package
-    metadata.  Keeping the exact exception makes VSI failures diagnosable.
+    VSI files can contain several Bio-Formats series (for example label, overview,
+    and one or more real acquisitions).  ``bioio`` exposes those scenes explicitly,
+    unlike the older direct BFIO path which effectively operated on the first series.
 
-    ``scyjava`` is configured before the JVM starts.  A full Zulu JDK 17 is requested
-    so ``jar`` and Maven tooling are available on first use.  Headless mode avoids
-    initializing Java AWT/Swing inside the Qt desktop application.
+    Java is configured before the reader plugin is imported.  The BioIO Bio-Formats
+    plugin uses the bffile/scyjava/cjdk stack and can provision Java automatically on
+    first use.
     """
     global _BFIO_IMPORT_ERROR, _BFIO_BOOTSTRAP_WARNING
     _BFIO_IMPORT_ERROR = None
@@ -216,26 +215,24 @@ def _try_import_bfio():
         try:
             scyjava_config.enable_headless_mode()
         except Exception:
-            # Headless mode is desirable but not required for VSI reading.
             pass
     except Exception as exc:
-        # Do not mislabel this as a missing bfio installation.  Continue with the
-        # import in case the machine already has a usable Java/JDK configuration.
         _BFIO_BOOTSTRAP_WARNING = (
             f"Could not configure automatic JDK 17 provisioning: "
             f"{type(exc).__name__}: {exc}"
         )
 
     try:
-        from bfio import BioReader
-        return BioReader
+        from bioio import BioImage
+        import bioio_bioformats
+        return BioImage, bioio_bioformats
     except Exception as exc:
-        detail = f"Could not import bfio.BioReader: {type(exc).__name__}: {exc}"
+        detail = f"Could not import BioIO/Bio-Formats: {type(exc).__name__}: {exc}"
         if "xsdata_pydantic_basemodel" in str(exc):
             detail += (
                 "\nThe frozen application is missing ome-types' dynamically imported "
                 "xsdata_pydantic_basemodel package. Rebuild with the updated "
-                "PathoImageToolkit.spec that explicitly collects this package."
+                "PathoImageToolkit.spec."
             )
         _BFIO_IMPORT_ERROR = detail
         return None
@@ -2284,7 +2281,7 @@ def convert_image_file(input_path: Path, output_dir: Optional[Path], output_kind
                 estimated, _shape, _axes, _dtype = _estimate_backend_raw_crop_bytes(
                     backend, 0, 0, full_w, full_h, downsample=effective_ds
                 )
-                # BFIO raw reads currently materialize the requested stack. Keep this
+                # Raw multichannel VSI export still materializes the requested stack. Keep this
                 # path conservative; for large VSI, users can uncheck raw preservation
                 # and use the memory-light RGB converter instead.
                 if estimated is not None and estimated <= MAX_PREVIEW_CROP_BYTES:
@@ -2301,7 +2298,7 @@ def convert_image_file(input_path: Path, output_dir: Optional[Path], output_kind
                 else:
                     raise RuntimeError(
                         "Raw multichannel VSI conversion would require too much memory for the current "
-                        "BFIO path. Disable 'Preserve raw channels' to convert the visual RGB image, "
+                        "BioIO/Bio-Formats path. Disable 'Preserve raw channels' to convert the visual RGB image, "
                         "or crop/tile the VSI first."
                     )
             else:
@@ -5330,6 +5327,9 @@ class ImageBackend:
         self._bio_dtype = None
         self._bio_channel_names = []
         self._bio_level_dims = None
+        self._vsi_scenes = []
+        self._vsi_scene_index = 0
+        self._vsi_scene_name = None
 
     def load(self, path: str):
         # Close any cached reader before loading a new file.
@@ -5361,6 +5361,9 @@ class ImageBackend:
         self._bio_dtype = None
         self._bio_channel_names = []
         self._bio_level_dims = None
+        self._vsi_scenes = []
+        self._vsi_scene_index = 0
+        self._vsi_scene_name = None
 
         lower_name = self.path_obj.name.lower()
 
@@ -5394,7 +5397,7 @@ class ImageBackend:
                 self.openslide_props = props or {}
                 return self
             except Exception as e:
-                self._fail_log.append(("Bio-Formats/BFIO", str(e)))
+                self._fail_log.append(("BioIO/Bio-Formats", str(e)))
 
         if _has_ext(lower_name, OPENSLIDE_EXTENSIONS):
             try:
@@ -5450,9 +5453,9 @@ class ImageBackend:
             "- For MRXS, make sure the .mrxs file is beside its associated data folder.\n"
             "- For TIFF/OME-TIFF/QPTIFF, make sure tifffile, zarr and imagecodecs are installed:\n"
             "  pip install tifffile zarr imagecodecs\n\n"
-            "- For Olympus/Evident VSI, install the optional Bio-Formats backend:\n"
-            "  pip install bfio\n"
-            "  The bfio Bio-Formats backend also requires a working Java/JDK setup.\n"
+            "- For Olympus/Evident VSI, install the BioIO Bio-Formats backend:\n"
+            "  pip install bioio bioio-bioformats\n"
+            "  Java is provisioned through scyjava/cjdk on first use.\n"
             "  Keep the .vsi file together with its associated ETS/data folder.\n"
         )
         raise RuntimeError("\n".join(msg))
@@ -5471,12 +5474,12 @@ class ImageBackend:
         self._openslide_obj = None
 
         if getattr(self, "_bio_reader", None) is not None:
-            try:
-                self._bio_reader.close()
-            except Exception:
-                pass
+            self._dispose_bioio(self._bio_reader)
         self._bio_reader = None
         self._bio_level_dims = None
+        self._vsi_scenes = []
+        self._vsi_scene_index = 0
+        self._vsi_scene_name = None
 
         if getattr(self, "_tif_obj", None) is not None:
             try:
@@ -5621,47 +5624,75 @@ class ImageBackend:
             raise RuntimeError("PIL/Pillow is not installed. Install with: pip install pillow")
         return np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8)
 
-    def _new_bioreader(self, level: int = 0):
-        """Open BFIO's Bio-Formats reader for VSI or another Bio-Formats source."""
-        BioReader = _try_import_bfio()
-        if BioReader is None:
-            detail = _BFIO_IMPORT_ERROR or "Unknown BFIO import/bootstrap error."
+    @staticmethod
+    def _vsi_scene_is_auxiliary(name: str) -> bool:
+        text = str(name or "").strip().lower()
+        auxiliary_words = (
+            "label", "overview", "macro", "thumbnail", "thumb", "barcode",
+            "preview", "map", "navigation", "navigator",
+        )
+        return any(word in text for word in auxiliary_words)
+
+    @staticmethod
+    def _bioio_scene_dims(img) -> Tuple[int, int, int, int, int]:
+        dims = img.dims
+        return (
+            int(getattr(dims, "X", 1)),
+            int(getattr(dims, "Y", 1)),
+            int(getattr(dims, "C", 1)),
+            int(getattr(dims, "Z", 1)),
+            int(getattr(dims, "T", 1)),
+        )
+
+    def _new_bioreader(self, level: int = 0, scene_index: Optional[int] = None):
+        """Open a BioIO Bio-Formats reader for the selected VSI scene."""
+        imported = _try_import_bioio_bioformats()
+        if imported is None:
+            detail = _BFIO_IMPORT_ERROR or "Unknown BioIO/Bio-Formats import/bootstrap error."
             raise RuntimeError(
                 "Olympus/Evident VSI support could not be initialized.\n\n"
-                "This does not necessarily mean that bfio is absent; a packaged build can "
-                "also fail because a BFIO/scyjava/JPype dependency or its package metadata "
-                "was not bundled correctly.\n\n"
+                "A packaged build can fail because BioIO/Bio-Formats, scyjava/JPype, "
+                "or plugin metadata was not bundled correctly.\n\n"
                 f"Initialization error: {detail}\n\n"
                 "For a source/development installation, install the VSI dependencies with:\n"
-                "    python -m pip install bfio scyjava\n\n"
+                "    python -m pip install bioio bioio-bioformats scyjava\n\n"
                 "PathoImage Toolkit requests a Zulu JDK 17 through scyjava/cjdk on first VSI "
                 "use, so an internet connection may be required the first time. Keep the .vsi "
                 "file beside its associated ETS/data folder."
             )
+        BioImage, bioio_bioformats = imported
+        img = BioImage(str(self.path), reader=bioio_bioformats.Reader)
+        idx = self._vsi_scene_index if scene_index is None else int(scene_index)
+        scenes = list(img.scenes)
+        if scenes:
+            idx = max(0, min(int(idx), len(scenes) - 1))
+            img.set_scene(idx)
+        if int(level) != 0:
+            try:
+                img.set_resolution_level(int(level))
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Bio-Formats scene '{getattr(img, 'current_scene', idx)}' does not expose "
+                    f"resolution level {level}: {exc}"
+                ) from exc
+        return img
+
+    def _dispose_bioio(self, img):
+        if img is None:
+            return
         try:
-            return BioReader(str(self.path), backend="bioformats", level=int(level))
-        except TypeError as exc:
-            # BFIO releases before multiresolution 'level=' support can still open
-            # level 0, but are not suitable for efficient WSI/VSI overview reads.
-            if int(level) == 0:
-                return BioReader(str(self.path), backend="bioformats")
-            raise RuntimeError(
-                "The installed bfio version does not support multiresolution 'level=' access. "
-                "Upgrade bfio to a current release before using large pyramidal VSI files."
-            ) from exc
+            reader = getattr(img, "reader", None)
+            close_fn = getattr(reader, "close", None)
+            if callable(close_fn):
+                close_fn()
+        except Exception:
+            pass
 
     def _get_bioreader(self):
         if self._bio_reader is None:
             self._bio_reader = self._new_bioreader(level=0)
-            try:
-                self._bio_shape = tuple(self._bio_reader.shape)
-            except Exception:
-                self._bio_shape = (
-                    int(self._bio_reader.Y), int(self._bio_reader.X),
-                    int(getattr(self._bio_reader, "Z", 1)),
-                    int(getattr(self._bio_reader, "C", 1)),
-                    int(getattr(self._bio_reader, "T", 1)),
-                )
+            w, h, c, z, t = self._bioio_scene_dims(self._bio_reader)
+            self._bio_shape = (t, c, z, h, w)
             try:
                 self._bio_dtype = np.dtype(self._bio_reader.dtype)
             except Exception:
@@ -5672,112 +5703,219 @@ class ImageBackend:
                 self._bio_channel_names = []
         return self._bio_reader
 
+    def _inspect_vsi_scenes(self, path: str) -> Tuple[List[Dict[str, Any]], int]:
+        """Return all Bio-Formats scenes and the automatically selected main scene."""
+        imported = _try_import_bioio_bioformats()
+        if imported is None:
+            raise RuntimeError(_BFIO_IMPORT_ERROR or "BioIO/Bio-Formats is unavailable.")
+        BioImage, bioio_bioformats = imported
+        img = BioImage(str(path), reader=bioio_bioformats.Reader)
+        infos: List[Dict[str, Any]] = []
+        try:
+            scenes = list(img.scenes)
+            for index, scene_id in enumerate(scenes):
+                try:
+                    img.set_scene(index)
+                    w, h, c, z, t = self._bioio_scene_dims(img)
+                    dtype_text = str(np.dtype(img.dtype))
+                    levels = list(getattr(img, "resolution_levels", ()) or ())
+                except Exception as exc:
+                    infos.append({
+                        "index": index,
+                        "name": str(scene_id),
+                        "width": 0,
+                        "height": 0,
+                        "channels": 0,
+                        "z": 0,
+                        "t": 0,
+                        "dtype": "unknown",
+                        "levels": [],
+                        "area": 0,
+                        "auxiliary": self._vsi_scene_is_auxiliary(str(scene_id)),
+                        "error": str(exc),
+                    })
+                    continue
+                infos.append({
+                    "index": index,
+                    "name": str(scene_id),
+                    "width": int(w),
+                    "height": int(h),
+                    "channels": int(c),
+                    "z": int(z),
+                    "t": int(t),
+                    "dtype": dtype_text,
+                    "levels": [int(v) for v in levels],
+                    "area": int(w) * int(h),
+                    "auxiliary": self._vsi_scene_is_auxiliary(str(scene_id)),
+                    "error": "",
+                })
+        finally:
+            self._dispose_bioio(img)
+
+        valid = [x for x in infos if x.get("width", 0) > 0 and x.get("height", 0) > 0]
+        main_candidates = [x for x in valid if not x.get("auxiliary", False)]
+        pool = main_candidates or valid
+        selected = max(pool, key=lambda x: x.get("area", 0))["index"] if pool else 0
+        return infos, int(selected)
+
+    def _apply_vsi_scene(self, scene_index: int):
+        if not self._vsi_scenes:
+            raise RuntimeError("No VSI scenes were discovered.")
+        scene_index = max(0, min(int(scene_index), len(self._vsi_scenes) - 1))
+        info = self._vsi_scenes[scene_index]
+        if int(info.get("width", 0)) <= 0 or int(info.get("height", 0)) <= 0:
+            raise RuntimeError(f"Selected VSI scene cannot be opened: {info.get('error', 'unknown error')}")
+        self._dispose_bioio(self._bio_reader)
+        self._bio_reader = None
+        self._bio_level_dims = None
+        self._vsi_scene_index = scene_index
+        self._vsi_scene_name = str(info.get("name", f"Scene {scene_index + 1}"))
+
+        br = self._get_bioreader()
+        w, h, c, z, t = self._bioio_scene_dims(br)
+        self.slide_dims = (int(w), int(h))
+        pps = getattr(br, "physical_pixel_sizes", None)
+        psx = getattr(pps, "X", None) if pps is not None else None
+        psy = getattr(pps, "Y", None) if pps is not None else None
+        try:
+            psx = float(psx) if psx is not None else None
+            psy = float(psy) if psy is not None else None
+        except Exception:
+            psx = psy = None
+        self.source_mpp = (psx, psy) if psx and psy and psx > 0 and psy > 0 else None
+        self.source_resolution = _mpp_to_resolution_tuple(psx, psy) if self.source_mpp else None
+        self.openslide_props = {
+            "bioformats.reader": "BioIO/Bio-Formats",
+            "bioformats.scene_index": str(scene_index),
+            "bioformats.scene_name": self._vsi_scene_name,
+            "bioformats.scene_count": str(len(self._vsi_scenes)),
+            "bioformats.shape_tczyx": str((t, c, z, h, w)),
+            "bioformats.dtype": str(np.dtype(br.dtype)),
+            "bioformats.channels": str(c),
+            "bioformats.z": str(z),
+            "bioformats.t": str(t),
+        }
+        return self
+
+    def select_vsi_scene(self, scene_index: int):
+        """Switch all preview/crop/tile operations to one VSI scene."""
+        return self._apply_vsi_scene(int(scene_index))
+
+    @property
+    def vsi_scenes(self) -> List[Dict[str, Any]]:
+        return [dict(x) for x in (self._vsi_scenes or [])]
+
+    @property
+    def vsi_scene_index(self) -> int:
+        return int(self._vsi_scene_index or 0)
+
+    @property
+    def vsi_scene_name(self) -> str:
+        return str(self._vsi_scene_name or "")
+
     def _probe_bioformats(self, path: str):
-        """Probe a VSI through BFIO/Bio-Formats without reading full-resolution pixels."""
+        """Probe all VSI scenes and automatically select the main acquisition."""
         original_path = self.path
         self.path = str(path)
-        br = None
         try:
-            br = self._new_bioreader(level=0)
-            w = int(br.X)
-            h = int(br.Y)
-            if w <= 0 or h <= 0:
-                raise ValueError(f"Bio-Formats returned invalid VSI dimensions: {w} x {h}")
-
-            psx = _bfio_physical_size_um(getattr(br, "physical_size_x", None))
-            psy = _bfio_physical_size_um(getattr(br, "physical_size_y", None))
-            mpp = (float(psx), float(psy)) if psx and psy and psx > 0 and psy > 0 else None
-            res_tuple = _mpp_to_resolution_tuple(mpp[0], mpp[1]) if mpp else None
-            try:
-                shape = tuple(br.shape)
-            except Exception:
-                shape = (h, w, int(getattr(br, "Z", 1)), int(getattr(br, "C", 1)), int(getattr(br, "T", 1)))
-            try:
-                dtype_text = str(np.dtype(br.dtype))
-            except Exception:
-                dtype_text = "unknown"
-            props = {
-                "bioformats.reader": "BFIO/Bio-Formats",
-                "bioformats.shape_yxzct": str(shape),
-                "bioformats.dtype": dtype_text,
-                "bioformats.channels": str(int(getattr(br, "C", 1))),
-                "bioformats.z": str(int(getattr(br, "Z", 1))),
-                "bioformats.t": str(int(getattr(br, "T", 1))),
-            }
-            return w, h, res_tuple, mpp, props
+            infos, selected = self._inspect_vsi_scenes(path)
+            if not infos:
+                raise RuntimeError("Bio-Formats did not report any scenes in this VSI file.")
+            self._vsi_scenes = infos
+            self._vsi_scene_index = int(selected)
+            self._vsi_scene_name = str(infos[selected].get("name", f"Scene {selected + 1}"))
+            self._apply_vsi_scene(selected)
+            w, h = self.slide_dims
+            return int(w), int(h), self.source_resolution, self.source_mpp, dict(self.openslide_props)
         except Exception as exc:
             bootstrap_note = (
                 f"\n\nJava bootstrap warning: {_BFIO_BOOTSTRAP_WARNING}"
                 if _BFIO_BOOTSTRAP_WARNING else ""
             )
             raise RuntimeError(
-                "Could not open this VSI through BFIO/Bio-Formats.\n\n"
+                "Could not open this VSI through BioIO/Bio-Formats.\n\n"
                 "Verify that the .vsi file remains beside its associated ETS/data folder. "
-                "If this is a standalone build, also verify that the BFIO/scyjava/JPype "
+                "If this is a standalone build, also verify that the BioIO/Bio-Formats "
                 "runtime was bundled correctly.\n\n"
                 f"Original error: {type(exc).__name__}: {exc}{bootstrap_note}"
             ) from exc
         finally:
-            if br is not None:
+            self.path = original_path if original_path is not None else str(path)
+
+    def vsi_scene_thumbnail(self, scene_index: int, max_side: int = 180) -> np.ndarray:
+        """Return a small RGB thumbnail for one VSI scene without changing selection."""
+        img = self._new_bioreader(level=0, scene_index=int(scene_index))
+        try:
+            try:
+                levels = list(img.resolution_levels or ())
+            except Exception:
+                levels = []
+            if levels:
+                # Resolution levels are documented highest -> lowest resolution.
                 try:
-                    br.close()
+                    img.set_resolution_level(int(levels[-1]))
                 except Exception:
                     pass
-            self.path = original_path if original_path is not None else str(path)
+            data = img.dask_data
+            # BioIO standard order is TCZYX. Read first T/Z and all channels.
+            raw = np.asarray(data[0, :, 0, :, :].compute())
+            if raw.ndim == 3:
+                arr = np.moveaxis(raw, 0, -1)
+                axes = "YXC"
+            elif raw.ndim == 2:
+                arr, axes = raw, "YX"
+            else:
+                arr, axes = np.squeeze(raw), _guess_axes_for_array(np.squeeze(raw))
+            rgb = _array_to_rgb_preview(arr, axes)
+            return _downsample_for_preview(rgb, max_side=max_side)
+        finally:
+            self._dispose_bioio(img)
 
     @staticmethod
     def _bioformats_yxc_from_read(arr: np.ndarray) -> Tuple[np.ndarray, str]:
-        """Convert BFIO YXZCT output to a representative YX/YXC display plane."""
+        """Convert BioIO C,Y,X (or Y,X) data to display YX/YXC."""
         arr = np.asarray(arr)
-        # BioReader.read() normally returns Y, X, Z, C, T.
-        if arr.ndim == 5:
-            arr = arr[:, :, 0, :, 0]
-        elif arr.ndim == 4:
-            # Be conservative: keep Y/X, first Z-like axis, final channel-like axis.
-            arr = arr[:, :, 0, :]
+        if arr.ndim == 3:
+            return np.moveaxis(arr, 0, -1), "YXC"
         arr = np.squeeze(arr)
         if arr.ndim == 2:
             return arr, "YX"
-        if arr.ndim == 3:
-            if arr.shape[-1] >= 1:
-                return arr, "YXC"
         return arr, _guess_axes_for_array(arr)
 
     def _bioformats_level_dimensions(self, max_levels: int = 12) -> List[Tuple[int, int, int]]:
-        """Discover usable VSI pyramid levels as (level, width, height)."""
+        """Discover usable resolution levels for the selected VSI scene."""
         if self._bio_level_dims is not None:
             return list(self._bio_level_dims)
-
-        full_w, full_h = self.slide_dims or (0, 0)
-        levels = [(0, int(full_w), int(full_h))]
-        previous = (int(full_w), int(full_h))
-        for level in range(1, max(1, int(max_levels))):
-            br = None
+        img = self._get_bioreader()
+        levels: List[Tuple[int, int, int]] = []
+        try:
+            level_ids = list(img.resolution_levels or (0,))
+        except Exception:
+            level_ids = [0]
+        current = getattr(img, "current_resolution_level", 0)
+        for level in level_ids[:max(1, int(max_levels))]:
             try:
-                br = self._new_bioreader(level=level)
-                dims = (int(br.X), int(br.Y))
-                if dims[0] <= 0 or dims[1] <= 0 or dims == previous or dims == (int(full_w), int(full_h)):
-                    break
-                # A pyramid level should not grow relative to the previous level.
-                if dims[0] > previous[0] or dims[1] > previous[1]:
-                    break
-                levels.append((int(level), dims[0], dims[1]))
-                previous = dims
-                if max(dims) <= 256:
-                    break
+                img.set_resolution_level(int(level))
+                w, h, _c, _z, _t = self._bioio_scene_dims(img)
+                if w > 0 and h > 0:
+                    levels.append((int(level), int(w), int(h)))
             except Exception:
-                break
-            finally:
-                if br is not None:
-                    try:
-                        br.close()
-                    except Exception:
-                        pass
+                continue
+        try:
+            img.set_resolution_level(int(current))
+        except Exception:
+            try:
+                img.set_resolution_level(0)
+            except Exception:
+                pass
+        if not levels:
+            full_w, full_h = self.slide_dims or (1, 1)
+            levels = [(0, int(full_w), int(full_h))]
         self._bio_level_dims = levels
         return list(levels)
 
     def _bioformats_preview_region(self, roi, max_side: int = 1200):
-        """Read a display region from the closest useful VSI pyramid level."""
+        """Read a display region from the closest useful VSI resolution level."""
         full_w, full_h = self.slide_dims
         x, y, w, h = [int(v) for v in roi]
         target_ds = max(1.0, max(float(w), float(h)) / float(max(1, max_side)))
@@ -5796,53 +5934,76 @@ class ImageBackend:
         lx1 = max(lx0 + 1, min(int(math.ceil((x + w) * scale_x)), level_w))
         ly1 = max(ly0 + 1, min(int(math.ceil((y + h) * scale_y)), level_h))
 
-        br = self._get_bioreader() if int(level) == 0 else self._new_bioreader(level=int(level))
-        close_after = int(level) != 0
+        img = self._get_bioreader()
+        current = getattr(img, "current_resolution_level", 0)
         try:
-            raw = br.read(X=[lx0, lx1], Y=[ly0, ly1], Z=0, C=None, T=0)
+            img.set_resolution_level(int(level))
+            data = img.dask_data  # TCZYX
+            raw = np.asarray(data[0, :, 0, ly0:ly1, lx0:lx1].compute())
             arr, axes = self._bioformats_yxc_from_read(raw)
             rgb = _array_to_rgb_preview(arr, axes)
             rgb = _downsample_for_preview(rgb, max_side=max_side)
             ds = max(float(full_w) / max(1.0, float(level_w)), float(full_h) / max(1.0, float(level_h)))
             return rgb, "YXS", {
-                "reader": "bioformats-vsi-region",
+                "reader": "bioio-bioformats-vsi-region",
                 "level": int(level),
                 "step": float(ds),
                 "level_dims": (int(level_w), int(level_h)),
+                "scene_index": int(self._vsi_scene_index),
+                "scene_name": self._vsi_scene_name,
                 "coordinate_space": "full-resolution image pixels",
             }
         finally:
-            if close_after:
+            try:
+                img.set_resolution_level(int(current))
+            except Exception:
                 try:
-                    br.close()
+                    img.set_resolution_level(0)
                 except Exception:
                     pass
 
     def _crop_bioformats(self, x: int, y: int, w: int, h: int):
-        br = self._get_bioreader()
-        raw = br.read(X=[int(x), int(x + w)], Y=[int(y), int(y + h)], Z=0, C=None, T=0)
-        arr, axes = self._bioformats_yxc_from_read(raw)
-        return _array_to_rgb_preview(arr, axes), {"used": False, "reader": "bioformats-vsi-level0"}
+        img = self._get_bioreader()
+        current = getattr(img, "current_resolution_level", 0)
+        try:
+            img.set_resolution_level(0)
+            data = img.dask_data
+            raw = np.asarray(data[0, :, 0, int(y):int(y + h), int(x):int(x + w)].compute())
+            arr, axes = self._bioformats_yxc_from_read(raw)
+            return _array_to_rgb_preview(arr, axes), {
+                "used": False,
+                "reader": "bioio-bioformats-vsi-level0",
+                "scene_index": int(self._vsi_scene_index),
+                "scene_name": self._vsi_scene_name,
+            }
+        finally:
+            try:
+                img.set_resolution_level(int(current))
+            except Exception:
+                pass
 
     def _crop_bioformats_raw(self, x: int, y: int, w: int, h: int):
         """Read a full-fidelity VSI ROI as TCZYX without display normalization."""
-        br = self._get_bioreader()
-        raw = np.asarray(
-            br.read(X=[int(x), int(x + w)], Y=[int(y), int(y + h)], Z=None, C=None, T=None)
-        )
-        if raw.ndim != 5:
-            # BFIO documents read() as YXZCT. Pad singleton trailing dimensions
-            # defensively for unusual readers.
-            while raw.ndim < 5:
-                raw = np.expand_dims(raw, axis=-1)
-        if raw.ndim != 5:
-            raise RuntimeError(f"Unexpected BFIO VSI array shape: {raw.shape}")
-        arr = np.transpose(raw, (4, 3, 2, 0, 1))  # YXZCT -> TCZYX
-        return np.ascontiguousarray(arr), "TCZYX", {
-            "used": False,
-            "reader": "bioformats-vsi-level0-raw",
-            "source_axes": "YXZCT",
-        }
+        img = self._get_bioreader()
+        current = getattr(img, "current_resolution_level", 0)
+        try:
+            img.set_resolution_level(0)
+            data = img.dask_data  # standardized TCZYX
+            arr = np.asarray(data[:, :, :, int(y):int(y + h), int(x):int(x + w)].compute())
+            if arr.ndim != 5:
+                raise RuntimeError(f"Unexpected BioIO VSI array shape: {arr.shape}")
+            return np.ascontiguousarray(arr), "TCZYX", {
+                "used": False,
+                "reader": "bioio-bioformats-vsi-level0-raw",
+                "source_axes": "TCZYX",
+                "scene_index": int(self._vsi_scene_index),
+                "scene_name": self._vsi_scene_name,
+            }
+        finally:
+            try:
+                img.set_resolution_level(int(current))
+            except Exception:
+                pass
 
     def _probe_openslide(self, path: str):
         openslide = _try_import_openslide()
@@ -13794,7 +13955,11 @@ class WSICropTileMergeGUI(QMainWindow):
         self.crop_file_label.setStyleSheet("padding: 10px; border: 1px solid #bdc3c7; border-radius: 5px;")
         browse_btn = QPushButton("Browse")
         browse_btn.clicked.connect(self.browse_crop_file)
+        self.crop_vsi_scene_btn = QPushButton("Change VSI image…")
+        self.crop_vsi_scene_btn.setVisible(False)
+        self.crop_vsi_scene_btn.clicked.connect(self.choose_crop_vsi_scene)
         file_layout.addWidget(browse_btn)
+        file_layout.addWidget(self.crop_vsi_scene_btn)
         file_layout.addWidget(self.crop_file_label, 1)
         layout.addLayout(file_layout)
 
@@ -14093,6 +14258,90 @@ class WSICropTileMergeGUI(QMainWindow):
             f"W={self.w_spin.value()}, H={self.h_spin.value()}"
         )
 
+    def _vsi_scene_label(self, info: Dict[str, Any]) -> str:
+        name = str(info.get("name", f"Scene {int(info.get('index', 0)) + 1}"))
+        w = int(info.get("width", 0) or 0)
+        h = int(info.get("height", 0) or 0)
+        c = int(info.get("channels", 0) or 0)
+        role = "Auxiliary" if info.get("auxiliary", False) else "Main-image candidate"
+        return f"{name}\n{w:,} × {h:,} px  •  {c} channel(s)  •  {role}"
+
+    def choose_crop_vsi_scene(self, force_dialog: bool = True):
+        """Show all internal VSI scenes with thumbnails and switch the active scene."""
+        if not getattr(self, "backend", None) or getattr(self.backend, "file_kind", "") != "vsi":
+            return False
+        scenes = self.backend.vsi_scenes
+        if not scenes:
+            return False
+        if len(scenes) <= 1 and not force_dialog:
+            return False
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Choose VSI image")
+        dlg.resize(780, 520)
+        root = QVBoxLayout(dlg)
+        intro = QLabel(
+            "This VSI contains multiple internal images. PathoImage Toolkit automatically "
+            "prefers the largest non-label/non-overview scene. Select another image here if needed."
+        )
+        intro.setWordWrap(True)
+        root.addWidget(intro)
+
+        scene_list = QListWidget()
+        scene_list.setIconSize(QSize(150, 105))
+        scene_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        root.addWidget(scene_list, 1)
+
+        selected_row = 0
+        for row, info in enumerate(scenes):
+            item = QListWidgetItem(self._vsi_scene_label(info))
+            item.setData(Qt.UserRole, int(info.get("index", row)))
+            try:
+                thumb = self.backend.vsi_scene_thumbnail(int(info.get("index", row)), max_side=180)
+                pm = _numpy_rgb_to_qpixmap(thumb)
+                item.setIcon(QIcon(pm))
+            except Exception as exc:
+                item.setToolTip(f"Thumbnail unavailable: {exc}")
+            if int(info.get("index", row)) == self.backend.vsi_scene_index:
+                selected_row = row
+                item.setText(item.text() + "   ✓ Auto-selected")
+            scene_list.addItem(item)
+
+        scene_list.setCurrentRow(selected_row)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        ok_button = buttons.button(QDialogButtonBox.Ok)
+        ok_button.setText("Open selected image")
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        root.addWidget(buttons)
+        scene_list.itemDoubleClicked.connect(lambda *_: dlg.accept())
+
+        if dlg.exec_() != QDialog.Accepted:
+            return False
+        current = scene_list.currentItem()
+        if current is None:
+            return False
+        scene_index = int(current.data(Qt.UserRole))
+        self.backend.select_vsi_scene(scene_index)
+        w, h = self.backend.slide_dims
+        self.x_spin.setMaximum(max(0, w - 1))
+        self.y_spin.setMaximum(max(0, h - 1))
+        self.w_spin.setMaximum(max(1, w))
+        self.h_spin.setMaximum(max(1, h))
+        self.crop_zoom = 1.0
+        self.crop_center = (w / 2.0, h / 2.0)
+        self.crop_preview_meta = {}
+        self.crop_file_label.setText(
+            f"{self.backend.path_obj.name}  •  {self.backend.vsi_scene_name}"
+        )
+        self.info_label.setText(
+            f"VSI scene: {self.backend.vsi_scene_name} | {w} x {h} px | "
+            f"Scene {self.backend.vsi_scene_index + 1}/{len(scenes)} | MPP: {_format_mpp_text(self.backend.source_mpp)}"
+        )
+        if self.crop_preview_chk.isChecked():
+            self.refresh_crop_input_preview()
+        return True
+
     def browse_crop_file(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select WSI", "", _image_file_filter())
         if not file_path:
@@ -14100,7 +14349,12 @@ class WSICropTileMergeGUI(QMainWindow):
         try:
             self.backend = ImageBackend().load(file_path)
             w, h = self.backend.slide_dims
-            self.crop_file_label.setText(os.path.basename(file_path))
+            if self.backend.file_kind == "vsi":
+                self.crop_file_label.setText(f"{os.path.basename(file_path)}  •  {self.backend.vsi_scene_name}")
+                self.crop_vsi_scene_btn.setVisible(len(self.backend.vsi_scenes) > 1)
+            else:
+                self.crop_file_label.setText(os.path.basename(file_path))
+                self.crop_vsi_scene_btn.setVisible(False)
             self.x_spin.setMaximum(max(0, w - 1))
             self.y_spin.setMaximum(max(0, h - 1))
             self.w_spin.setMaximum(max(1, w))
@@ -14109,8 +14363,15 @@ class WSICropTileMergeGUI(QMainWindow):
             self.crop_center = (w / 2.0, h / 2.0)
             self.crop_preview_meta = {}
             print("Loaded with:", self.backend.reader, self.backend.file_kind, self.backend.path_obj.suffix)
-            self.info_label.setText(f"Loaded: {Path(file_path).name} | Size: {w} x {h} px | Reader: {self.backend.reader} | MPP: {_format_mpp_text(self.backend.source_mpp)}")
-            if self.crop_preview_chk.isChecked():
+            scene_extra = ""
+            if self.backend.file_kind == "vsi":
+                scene_extra = f" | VSI image: {self.backend.vsi_scene_name} ({self.backend.vsi_scene_index + 1}/{len(self.backend.vsi_scenes)})"
+            self.info_label.setText(f"Loaded: {Path(file_path).name} | Size: {w} x {h} px | Reader: {self.backend.reader}{scene_extra} | MPP: {_format_mpp_text(self.backend.source_mpp)}")
+            if self.backend.file_kind == "vsi" and len(self.backend.vsi_scenes) > 1:
+                # Show the series chooser once on load, with the automatically selected
+                # main acquisition preselected. Users can reopen it later from the button.
+                self.choose_crop_vsi_scene(force_dialog=True)
+            elif self.crop_preview_chk.isChecked():
                 self.refresh_crop_input_preview()
         except Exception as e:
             QMessageBox.critical(self, "Error", _exception_text(e))

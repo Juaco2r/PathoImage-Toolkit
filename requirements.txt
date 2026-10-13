@@ -13,8 +13,9 @@ readlif>=0.6.6
 beautifulsoup4>=4.12
 soupsieve>=2.5
 
-# Olympus / Evident VSI support through BFIO + Bio-Formats
-bfio==2.5.0
+# Olympus / Evident VSI support through BioIO + Bio-Formats
+bioio==3.5.1
+bioio-bioformats==2.0.0
 scyjava>=1.12.5,<2
 
 # Build dependency for creating the standalone executable

@@ -19,7 +19,7 @@ keywords:
   - image tiling
   - tile merging
   - Python
-abstract: "PathoImage Toolkit is an open-source desktop application for digital pathology and microscopy image workflows, including image visualization, ROI cropping, tiling, reconstruction, batch format conversion, downsampling, multichannel image handling, OME-TIFF and QPTIFF support, Olympus/Evident VSI reading through BFIO/Bio-Formats, Leica LIF conversion, metadata preservation, and GeoJSON annotation workflows."
+abstract: "PathoImage Toolkit is an open-source desktop application for digital pathology and microscopy image workflows, including image visualization, ROI cropping, tiling, reconstruction, batch format conversion, downsampling, multichannel image handling, OME-TIFF and QPTIFF support, Olympus/Evident VSI multi-scene reading through BioIO/Bio-Formats, Leica LIF conversion, metadata preservation, and GeoJSON annotation workflows."
 message: "If you use this software, please cite it as below."
 authors:
   - given-names: José

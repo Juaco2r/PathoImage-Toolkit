@@ -28,20 +28,23 @@ imagecodecs_datas, imagecodecs_binaries, imagecodecs_hiddenimports = collect_all
 numcodecs_datas, numcodecs_binaries, numcodecs_hiddenimports = collect_all("numcodecs")
 zarr_datas, zarr_binaries, zarr_hiddenimports = collect_all("zarr")
 
-# Olympus/Evident VSI support. BFIO uses dynamic imports, JPype, scyjava/jgo,
-# cjdk and a compiled bfiocpp extension, so collect them explicitly.
+# Olympus/Evident VSI support through BioIO + Bio-Formats.
+# BioIO discovers readers through package metadata/entry points and bioio-bioformats
+# uses bffile/scyjava/JPype/cjdk dynamically, so collect the plugin stack explicitly.
 vsi_packages = (
-    "bfio",
-    "bfiocpp",
+    "bioio",
+    "bioio_base",
+    "bioio_bioformats",
+    "bffile",
     "ome_types",
-    # ome-types 0.6.x ships additional top-level packages that are imported
-    # dynamically through xsdata hooks. They are siblings of ome_types, so
-    # collecting ome_types alone does not make PyInstaller include them.
     "xsdata_pydantic_basemodel",
     "xsdata",
     "pydantic",
     "pydantic_core",
     "pydantic_extra_types",
+    "dask",
+    "xarray",
+    "fsspec",
     "scyjava",
     "jpype",
     "jgo",
@@ -51,25 +54,27 @@ vsi_datas = []
 vsi_binaries = []
 vsi_hiddenimports = []
 for package_name in vsi_packages:
-    _datas, _binaries, _hidden = collect_all(package_name)
+    try:
+        _datas, _binaries, _hidden = collect_all(package_name)
+    except Exception:
+        _datas, _binaries, _hidden = [], [], []
     vsi_datas += _datas
     vsi_binaries += _binaries
     vsi_hiddenimports += _hidden
 
-# PyInstaller does not include distribution metadata merely because a package is
-# collected. scyjava/jgo/cjdk and parts of the BFIO stack may query installed
-# distributions at runtime, so preserve the metadata explicitly. Recursive BFIO
-# metadata also covers its declared dependencies.
+# Preserve distribution metadata used by BioIO's plugin registry and Java stack.
 vsi_metadata = []
 for distribution_name in (
-    "bfio", "scyjava", "jgo", "cjdk", "JPype1", "ome-types", "bfiocpp",
-    "xsdata", "pydantic", "pydantic-extra-types"
+    "bioio", "bioio-base", "bioio-bioformats", "bffile",
+    "scyjava", "jgo", "cjdk", "JPype1", "ome-types",
+    "xsdata", "pydantic", "pydantic-extra-types", "dask", "xarray", "fsspec"
 ):
     try:
-        vsi_metadata += copy_metadata(distribution_name, recursive=(distribution_name == "bfio"))
+        vsi_metadata += copy_metadata(
+            distribution_name,
+            recursive=(distribution_name in {"bioio", "bioio-bioformats"}),
+        )
     except Exception:
-        # Some platform-specific wheels/distribution names may not exist during a
-        # build. The explicit package collection above remains the primary path.
         pass
 
 # Leica LIF support.
@@ -133,8 +138,10 @@ hiddenimports = [
     "openslide",
 
     # Olympus / Evident VSI support
-    "bfio",
-    "bfiocpp",
+    "bioio",
+    "bioio_base",
+    "bioio_bioformats",
+    "bffile",
     "ome_types",
     "xsdata_pydantic_basemodel",
     "xsdata_pydantic_basemodel.hooks",
@@ -142,6 +149,9 @@ hiddenimports = [
     "pydantic",
     "pydantic_core",
     "pydantic_extra_types",
+    "dask",
+    "xarray",
+    "fsspec",
     "scyjava",
     "jpype",
     "jgo",

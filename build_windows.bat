@@ -13,8 +13,8 @@ if exist venv\Scripts\activate.bat (
 )
 
 REM Verify the build is using the expected dependency stack.
-python -c "import sys, imagecodecs, zarr, bfio, scyjava, jpype, xsdata_pydantic_basemodel.hooks; print('Python:', sys.executable); print('BFIO:', bfio.__version__); print('Zarr:', zarr.__version__); print('OME/xsdata hooks: OK')"
-python -c "from importlib.metadata import version; print('BFIO metadata:', version('bfio')); print('scyjava metadata:', version('scyjava')); print('JPype1 metadata:', version('JPype1'))"
+python -c "import sys, imagecodecs, zarr, bioio, bioio_bioformats, scyjava, jpype; print('Python:', sys.executable); print('BioIO:', bioio.__version__); print('Zarr:', zarr.__version__); print('BioIO Bio-Formats import: OK')"
+python -c "from importlib.metadata import version; print('BioIO metadata:', version('bioio')); print('bioio-bioformats metadata:', version('bioio-bioformats')); print('scyjava metadata:', version('scyjava'))"
 if errorlevel 1 (
     echo.
     echo ERROR: Required dependencies are missing from this Python environment.
@@ -41,7 +41,7 @@ echo ===============================
 echo BUILD COMPLETE
 echo Output in dist
 
-echo NOTE: VSI support provisions a Zulu JDK 17 / Bio-Formats runtime on first use.
+echo NOTE: VSI support uses BioIO/Bio-Formats and provisions a Zulu JDK 17 runtime on first use.
 echo The first VSI open may therefore require an internet connection.
 echo ===============================
 

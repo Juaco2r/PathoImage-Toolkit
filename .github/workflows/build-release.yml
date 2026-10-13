@@ -70,8 +70,8 @@ jobs:
       # -----------------------------
       - name: Check image and VSI dependencies
         run: |
-          python -c "import imagecodecs, zarr, bfio, scyjava, jpype, xsdata_pydantic_basemodel.hooks; print('imagecodecs:', imagecodecs.version()); print('zarr:', zarr.__version__); print('bfio:', bfio.__version__); print('scyjava import: OK'); print('jpype import: OK'); print('OME/xsdata hooks: OK')"
-          python -c "from importlib.metadata import version; print('bfio metadata:', version('bfio')); print('scyjava metadata:', version('scyjava')); print('JPype1 metadata:', version('JPype1'))"
+          python -c "import imagecodecs, zarr, bioio, bioio_bioformats, scyjava, jpype; print('imagecodecs:', imagecodecs.version()); print('zarr:', zarr.__version__); print('bioio:', bioio.__version__); print('bioio-bioformats import: OK'); print('scyjava import: OK')"
+          python -c "from importlib.metadata import version; print('bioio metadata:', version('bioio')); print('bioio-bioformats metadata:', version('bioio-bioformats')); print('scyjava metadata:', version('scyjava'))"
 
       # -----------------------------
       # Build
@@ -93,19 +93,26 @@ jobs:
             --collect-all imagecodecs \
             --collect-all numcodecs \
             --collect-all zarr \
-            --collect-all bfio \
-            --collect-all bfiocpp \
+            --collect-all bioio \
+            --collect-all bioio_base \
+            --collect-all bioio_bioformats \
+            --collect-all bffile \
             --collect-all ome_types \
             --collect-all xsdata_pydantic_basemodel \
             --collect-all xsdata \
             --collect-all pydantic \
             --collect-all pydantic_core \
             --collect-all pydantic_extra_types \
+            --collect-all dask \
+            --collect-all xarray \
+            --collect-all fsspec \
             --collect-all scyjava \
             --collect-all jpype \
             --collect-all jgo \
             --collect-all cjdk \
-            --recursive-copy-metadata bfio \
+            --recursive-copy-metadata bioio \
+            --recursive-copy-metadata bioio-bioformats \
+            --copy-metadata bffile \
             --copy-metadata scyjava \
             --copy-metadata jgo \
             --copy-metadata cjdk \
@@ -114,7 +121,6 @@ jobs:
             --copy-metadata xsdata \
             --copy-metadata pydantic \
             --copy-metadata pydantic-extra-types \
-            --copy-metadata bfiocpp \
             --collect-all readlif \
             --collect-all bs4 \
             --collect-all soupsieve \
@@ -134,19 +140,26 @@ jobs:
             --collect-all imagecodecs \
             --collect-all numcodecs \
             --collect-all zarr \
-            --collect-all bfio \
-            --collect-all bfiocpp \
+            --collect-all bioio \
+            --collect-all bioio_base \
+            --collect-all bioio_bioformats \
+            --collect-all bffile \
             --collect-all ome_types \
             --collect-all xsdata_pydantic_basemodel \
             --collect-all xsdata \
             --collect-all pydantic \
             --collect-all pydantic_core \
             --collect-all pydantic_extra_types \
+            --collect-all dask \
+            --collect-all xarray \
+            --collect-all fsspec \
             --collect-all scyjava \
             --collect-all jpype \
             --collect-all jgo \
             --collect-all cjdk \
-            --recursive-copy-metadata bfio \
+            --recursive-copy-metadata bioio \
+            --recursive-copy-metadata bioio-bioformats \
+            --copy-metadata bffile \
             --copy-metadata scyjava \
             --copy-metadata jgo \
             --copy-metadata cjdk \
@@ -155,7 +168,6 @@ jobs:
             --copy-metadata xsdata \
             --copy-metadata pydantic \
             --copy-metadata pydantic-extra-types \
-            --copy-metadata bfiocpp \
             --collect-all readlif \
             --collect-all bs4 \
             --collect-all soupsieve \

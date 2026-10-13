@@ -87,13 +87,17 @@ On Windows, unsigned executables downloaded from GitHub may trigger a security w
 | TIFF / pyramidal TIFF | tifffile / OpenSlide | Pyramid support when available |
 | OME-TIFF | tifffile / OpenSlide | Physical pixel size preserved when available |
 | QPTIFF | tifffile | Akoya/PerkinElmer TIFF-family images; primary full-resolution series selected automatically |
-| VSI | BFIO / Bio-Formats | Olympus/Evident cellSens; keep the `.vsi` with its associated ETS/data folder |
 | SVS | OpenSlide / tifffile fallback | Common digital pathology format |
 | NDPI | OpenSlide | Requires OpenSlide support |
 | MRXS | OpenSlide | The `.mrxs` file must remain beside its associated data folder |
 | SCN / VMS / VMU / BIF / SVSlide | OpenSlide | Support depends on the OpenSlide backend |
 | DICOM / DCM | OpenSlide | Support depends on OpenSlide compatibility |
+| VSI | BioIO / Bio-Formats | Multi-scene support; label/overview scenes are deprioritized automatically; keep associated ETS/data beside the `.vsi` |
 | JPEG / PNG | Pillow | Mainly useful for tiles or simple raster inputs |
+
+### VSI multi-image handling
+
+Olympus/Evident VSI files may contain several internal images such as `label`, `overview`, and one or more real acquisitions. PathoImage Toolkit enumerates the available Bio-Formats scenes, automatically selects the largest non-label/non-overview scene, and shows a thumbnail chooser in Crop mode so the active scene can be changed manually. Batch conversion uses the automatically selected main scene.
 
 ---
 
@@ -183,7 +187,7 @@ For exact full-resolution preservation when JPEG is not possible, use TIFF/OME-T
 
 ### VSI first use
 
-VSI files are read through BFIO/Bio-Formats. PathoImage Toolkit configures scyjava to use a **Zulu JDK 17**. The first VSI open on a computer may download the JDK and Bio-Formats/Maven runtime into the user's local cache, so an internet connection may be required the first time. Later uses reuse the cached runtime. Keep each `.vsi` together with its associated ETS/data folder.
+VSI files are read through BioIO/Bio-Formats. PathoImage Toolkit configures scyjava to use a **Zulu JDK 17**. The first VSI open on a computer may download the JDK and Bio-Formats/Maven runtime into the user's local cache, so an internet connection may be required the first time. Later uses reuse the cached runtime. Keep each `.vsi` together with its associated ETS/data folder.
 
 ---
 
@@ -419,7 +423,7 @@ Alternative using the spec file:
 pyinstaller --noconfirm --clean PathoImageToolkit.spec
 ```
 
-The build script/spec bundles the Python dependencies required by OpenSlide, imagecodecs, BFIO/scyjava and the other supported readers. A JDK is not embedded in the executable; VSI support provisions its Java/Bio-Formats runtime on first use.
+The build script/spec bundles the Python dependencies required by OpenSlide, imagecodecs, BioIO/Bio-Formats/scyjava and the other supported readers. A JDK is not embedded in the executable; VSI support provisions its Java/Bio-Formats runtime on first use.
 
 ---
 
@@ -510,7 +514,7 @@ This project depends on:
 - numcodecs
 - PyQt5
 - OpenSlide / openslide-python / openslide-bin
-- BFIO / Bio-Formats
+- BioIO / bioio-bioformats / bffile / Bio-Formats
 - scyjava / JPype / jgo / cjdk
 - readlif / Beautiful Soup / soupsieve
 - PyInstaller for building executables
