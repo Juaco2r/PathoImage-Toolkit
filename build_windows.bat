@@ -14,6 +14,7 @@ if exist venv\Scripts\activate.bat (
 
 REM Verify the build is using the expected dependency stack.
 python -c "import sys, imagecodecs, zarr, bfio, scyjava, jpype; print('Python:', sys.executable); print('BFIO:', bfio.__version__); print('Zarr:', zarr.__version__)"
+python -c "from importlib.metadata import version; print('BFIO metadata:', version('bfio')); print('scyjava metadata:', version('scyjava')); print('JPype1 metadata:', version('JPype1'))"
 if errorlevel 1 (
     echo.
     echo ERROR: Required dependencies are missing from this Python environment.

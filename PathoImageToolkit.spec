@@ -6,6 +6,7 @@ from PyInstaller.utils.hooks import (
     collect_dynamic_libs,
     collect_submodules,
     collect_data_files,
+    copy_metadata,
 )
 
 block_cipher = None
@@ -39,6 +40,19 @@ for package_name in vsi_packages:
     vsi_binaries += _binaries
     vsi_hiddenimports += _hidden
 
+# PyInstaller does not include distribution metadata merely because a package is
+# collected. scyjava/jgo/cjdk and parts of the BFIO stack may query installed
+# distributions at runtime, so preserve the metadata explicitly. Recursive BFIO
+# metadata also covers its declared dependencies.
+vsi_metadata = []
+for distribution_name in ("bfio", "scyjava", "jgo", "cjdk", "JPype1", "ome-types", "bfiocpp"):
+    try:
+        vsi_metadata += copy_metadata(distribution_name, recursive=(distribution_name == "bfio"))
+    except Exception:
+        # Some platform-specific wheels/distribution names may not exist during a
+        # build. The explicit package collection above remains the primary path.
+        pass
+
 # Leica LIF support.
 # readlif is imported lazily in the app, so PyInstaller may not detect it
 # unless it is explicitly collected here.
@@ -69,6 +83,7 @@ datas += imagecodecs_datas
 datas += numcodecs_datas
 datas += zarr_datas
 datas += vsi_datas
+datas += vsi_metadata
 datas += readlif_datas
 datas += bs4_datas
 datas += soupsieve_datas

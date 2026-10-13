@@ -185,21 +185,52 @@ def _try_import_pil():
         return None
 
 
-def _try_import_bfio():
-    """Return bfio.BioReader and provision a compatible JDK for Bio-Formats.
+_BFIO_IMPORT_ERROR = None
+_BFIO_BOOTSTRAP_WARNING = None
 
-    scyjava must be configured before the JVM starts.  Asking cjdk for a full
-    Zulu JDK 17 (rather than a JRE-only runtime) ensures that Java tools such as
-    ``jar`` are available when jgo prepares the Bio-Formats environment.  The
-    runtime is downloaded to the user's cjdk cache on first VSI use and reused
-    afterwards.
+
+def _try_import_bfio():
+    """Return ``bfio.BioReader`` and prepare Java for the Bio-Formats backend.
+
+    The import is intentionally split into stages.  Earlier builds swallowed every
+    exception and then reported that ``bfio`` was not installed, even when the real
+    problem was a frozen/PyInstaller dependency, Java bootstrap, or missing package
+    metadata.  Keeping the exact exception makes VSI failures diagnosable.
+
+    ``scyjava`` is configured before the JVM starts.  A full Zulu JDK 17 is requested
+    so ``jar`` and Maven tooling are available on first use.  Headless mode avoids
+    initializing Java AWT/Swing inside the Qt desktop application.
     """
+    global _BFIO_IMPORT_ERROR, _BFIO_BOOTSTRAP_WARNING
+    _BFIO_IMPORT_ERROR = None
+    _BFIO_BOOTSTRAP_WARNING = None
+
     try:
         from scyjava import config as scyjava_config
+    except Exception as exc:
+        _BFIO_IMPORT_ERROR = f"Could not import scyjava: {type(exc).__name__}: {exc}"
+        return None
+
+    try:
         scyjava_config.set_java_constraints(fetch=True, vendor="zulu", version="17")
+        try:
+            scyjava_config.enable_headless_mode()
+        except Exception:
+            # Headless mode is desirable but not required for VSI reading.
+            pass
+    except Exception as exc:
+        # Do not mislabel this as a missing bfio installation.  Continue with the
+        # import in case the machine already has a usable Java/JDK configuration.
+        _BFIO_BOOTSTRAP_WARNING = (
+            f"Could not configure automatic JDK 17 provisioning: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    try:
         from bfio import BioReader
         return BioReader
-    except Exception:
+    except Exception as exc:
+        _BFIO_IMPORT_ERROR = f"Could not import bfio.BioReader: {type(exc).__name__}: {exc}"
         return None
 
 
@@ -5587,13 +5618,18 @@ class ImageBackend:
         """Open BFIO's Bio-Formats reader for VSI or another Bio-Formats source."""
         BioReader = _try_import_bfio()
         if BioReader is None:
+            detail = _BFIO_IMPORT_ERROR or "Unknown BFIO import/bootstrap error."
             raise RuntimeError(
-                "Olympus/Evident VSI requires the optional 'bfio' package.\n\n"
-                "Install it in the same Python environment used by PathoImage Toolkit:\n"
-                "    pip install bfio\n\n"
-                "The BFIO Bio-Formats backend uses scyjava/cjdk to provision a Zulu JDK 17 "
-                "on first use, so an internet connection may be required the first time. "
-                "Keep the .vsi file beside its associated ETS/data folder."
+                "Olympus/Evident VSI support could not be initialized.\n\n"
+                "This does not necessarily mean that bfio is absent; a packaged build can "
+                "also fail because a BFIO/scyjava/JPype dependency or its package metadata "
+                "was not bundled correctly.\n\n"
+                f"Initialization error: {detail}\n\n"
+                "For a source/development installation, install the VSI dependencies with:\n"
+                "    python -m pip install bfio scyjava\n\n"
+                "PathoImage Toolkit requests a Zulu JDK 17 through scyjava/cjdk on first VSI "
+                "use, so an internet connection may be required the first time. Keep the .vsi "
+                "file beside its associated ETS/data folder."
             )
         try:
             return BioReader(str(self.path), backend="bioformats", level=int(level))
@@ -5663,11 +5699,16 @@ class ImageBackend:
             }
             return w, h, res_tuple, mpp, props
         except Exception as exc:
+            bootstrap_note = (
+                f"\n\nJava bootstrap warning: {_BFIO_BOOTSTRAP_WARNING}"
+                if _BFIO_BOOTSTRAP_WARNING else ""
+            )
             raise RuntimeError(
                 "Could not open this VSI through BFIO/Bio-Formats.\n\n"
-                "Verify that 'bfio' and Java/JDK are installed in the same environment, "
-                "and that the .vsi file remains beside its associated ETS/data folder.\n\n"
-                f"Original error: {exc}"
+                "Verify that the .vsi file remains beside its associated ETS/data folder. "
+                "If this is a standalone build, also verify that the BFIO/scyjava/JPype "
+                "runtime was bundled correctly.\n\n"
+                f"Original error: {type(exc).__name__}: {exc}{bootstrap_note}"
             ) from exc
         finally:
             if br is not None:

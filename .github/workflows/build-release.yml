@@ -71,6 +71,7 @@ jobs:
       - name: Check image and VSI dependencies
         run: |
           python -c "import imagecodecs, zarr, bfio, scyjava, jpype; print('imagecodecs:', imagecodecs.version()); print('zarr:', zarr.__version__); print('bfio:', bfio.__version__); print('scyjava import: OK'); print('jpype import: OK')"
+          python -c "from importlib.metadata import version; print('bfio metadata:', version('bfio')); print('scyjava metadata:', version('scyjava')); print('JPype1 metadata:', version('JPype1'))"
 
       # -----------------------------
       # Build
@@ -99,6 +100,13 @@ jobs:
             --collect-all jpype \
             --collect-all jgo \
             --collect-all cjdk \
+            --recursive-copy-metadata bfio \
+            --copy-metadata scyjava \
+            --copy-metadata jgo \
+            --copy-metadata cjdk \
+            --copy-metadata JPype1 \
+            --copy-metadata ome-types \
+            --copy-metadata bfiocpp \
             --collect-all readlif \
             --collect-all bs4 \
             --collect-all soupsieve \
@@ -125,6 +133,13 @@ jobs:
             --collect-all jpype \
             --collect-all jgo \
             --collect-all cjdk \
+            --recursive-copy-metadata bfio \
+            --copy-metadata scyjava \
+            --copy-metadata jgo \
+            --copy-metadata cjdk \
+            --copy-metadata JPype1 \
+            --copy-metadata ome-types \
+            --copy-metadata bfiocpp \
             --collect-all readlif \
             --collect-all bs4 \
             --collect-all soupsieve \
