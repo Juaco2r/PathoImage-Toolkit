@@ -1,21 +1,33 @@
 @echo off
+setlocal
+
 echo ===============================
 echo Building PathoImage Toolkit
 echo ===============================
 
-REM Activate venv
-if exist venv\Scripts\activate (
-    call venv\Scripts\activate
+REM Activate venv when present.
+if exist venv\Scripts\activate.bat (
+    call venv\Scripts\activate.bat
 ) else (
     echo WARNING: venv not found. Using current Python environment.
 )
 
-REM Clean previous builds
+REM Verify the build is using the expected dependency stack.
+python -c "import sys, imagecodecs, zarr, bfio, scyjava, jpype; print('Python:', sys.executable); print('BFIO:', bfio.__version__); print('Zarr:', zarr.__version__)"
+if errorlevel 1 (
+    echo.
+    echo ERROR: Required dependencies are missing from this Python environment.
+    echo Run: python -m pip install -r requirements.txt
+    pause
+    exit /b 1
+)
+
+REM Clean previous builds.
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 
-REM Build using spec file
-pyinstaller --clean --noconfirm PathoImageToolkit.spec
+REM Build using the repository spec file and the active Python environment.
+python -m PyInstaller --clean --noconfirm PathoImageToolkit.spec
 if errorlevel 1 (
     echo ===============================
     echo BUILD FAILED
@@ -26,7 +38,11 @@ if errorlevel 1 (
 
 echo ===============================
 echo BUILD COMPLETE
-echo Output in /dist
+echo Output in dist
+
+echo NOTE: VSI support provisions a Zulu JDK 17 / Bio-Formats runtime on first use.
+echo The first VSI open may therefore require an internet connection.
 echo ===============================
 
 pause
+endlocal

@@ -68,9 +68,9 @@ jobs:
       # Diagnostic check
       # IMPORTANT: use python -c instead of bash heredoc because Windows uses PowerShell by default.
       # -----------------------------
-      - name: Check imagecodecs installation
+      - name: Check image and VSI dependencies
         run: |
-          python -c "import imagecodecs; print('imagecodecs version:', imagecodecs.version()); print('delta_encode available:', hasattr(imagecodecs, 'delta_encode')); print('delta_decode available:', hasattr(imagecodecs, 'delta_decode'))"
+          python -c "import imagecodecs, zarr, bfio, scyjava, jpype; print('imagecodecs:', imagecodecs.version()); print('zarr:', zarr.__version__); print('bfio:', bfio.__version__); print('scyjava import: OK'); print('jpype import: OK')"
 
       # -----------------------------
       # Build
@@ -92,6 +92,16 @@ jobs:
             --collect-all imagecodecs \
             --collect-all numcodecs \
             --collect-all zarr \
+            --collect-all bfio \
+            --collect-all bfiocpp \
+            --collect-all ome_types \
+            --collect-all scyjava \
+            --collect-all jpype \
+            --collect-all jgo \
+            --collect-all cjdk \
+            --collect-all readlif \
+            --collect-all bs4 \
+            --collect-all soupsieve \
             --hidden-import imagecodecs._shared \
             --hidden-import imagecodecs._imcd \
             --add-data "assets:assets" \
@@ -108,6 +118,16 @@ jobs:
             --collect-all imagecodecs \
             --collect-all numcodecs \
             --collect-all zarr \
+            --collect-all bfio \
+            --collect-all bfiocpp \
+            --collect-all ome_types \
+            --collect-all scyjava \
+            --collect-all jpype \
+            --collect-all jgo \
+            --collect-all cjdk \
+            --collect-all readlif \
+            --collect-all bs4 \
+            --collect-all soupsieve \
             --hidden-import imagecodecs._shared \
             --hidden-import imagecodecs._imcd \
             --add-data "assets:assets" \

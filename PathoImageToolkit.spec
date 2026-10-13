@@ -27,6 +27,18 @@ imagecodecs_datas, imagecodecs_binaries, imagecodecs_hiddenimports = collect_all
 numcodecs_datas, numcodecs_binaries, numcodecs_hiddenimports = collect_all("numcodecs")
 zarr_datas, zarr_binaries, zarr_hiddenimports = collect_all("zarr")
 
+# Olympus/Evident VSI support. BFIO uses dynamic imports, JPype, scyjava/jgo,
+# cjdk and a compiled bfiocpp extension, so collect them explicitly.
+vsi_packages = ("bfio", "bfiocpp", "ome_types", "scyjava", "jpype", "jgo", "cjdk")
+vsi_datas = []
+vsi_binaries = []
+vsi_hiddenimports = []
+for package_name in vsi_packages:
+    _datas, _binaries, _hidden = collect_all(package_name)
+    vsi_datas += _datas
+    vsi_binaries += _binaries
+    vsi_hiddenimports += _hidden
+
 # Leica LIF support.
 # readlif is imported lazily in the app, so PyInstaller may not detect it
 # unless it is explicitly collected here.
@@ -56,6 +68,7 @@ if os.path.isdir(assets_path):
 datas += imagecodecs_datas
 datas += numcodecs_datas
 datas += zarr_datas
+datas += vsi_datas
 datas += readlif_datas
 datas += bs4_datas
 datas += soupsieve_datas
@@ -68,6 +81,7 @@ binaries = []
 binaries += imagecodecs_binaries
 binaries += numcodecs_binaries
 binaries += zarr_binaries
+binaries += vsi_binaries
 binaries += openslide_binaries
 
 # ============================================================
@@ -83,6 +97,15 @@ hiddenimports = [
     "numcodecs",
     "imagecodecs",
     "openslide",
+
+    # Olympus / Evident VSI support
+    "bfio",
+    "bfiocpp",
+    "ome_types",
+    "scyjava",
+    "jpype",
+    "jgo",
+    "cjdk",
 
     # Leica LIF support
     "readlif",
@@ -116,6 +139,7 @@ hiddenimports = [
 hiddenimports += imagecodecs_hiddenimports
 hiddenimports += numcodecs_hiddenimports
 hiddenimports += zarr_hiddenimports
+hiddenimports += vsi_hiddenimports
 hiddenimports += readlif_hiddenimports
 hiddenimports += bs4_hiddenimports
 hiddenimports += soupsieve_hiddenimports

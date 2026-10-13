@@ -1,4 +1,3 @@
-﻿
 import os
 import sys
 import re
@@ -9,6 +8,8 @@ import traceback
 import threading
 import tempfile
 import shutil
+import atexit
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -24,7 +25,7 @@ from PyQt5.QtWidgets import (
     QSpinBox, QMessageBox, QComboBox, QCheckBox, QGroupBox,
     QStackedWidget, QDoubleSpinBox, QProgressBar, QDialog,
     QTableWidget, QTableWidgetItem, QTextBrowser, QDialogButtonBox,
-    QScrollArea, QShortcut, QSlider, QColorDialog, QSizePolicy,
+    QScrollArea, QShortcut, QSlider, QColorDialog, QSizePolicy, QInputDialog,
     QListWidget, QListWidgetItem, QAbstractItemView
 )
 from PyQt5.QtCore import Qt, QRect, QPoint, QPointF, QThread, pyqtSignal, QTimer, QSize
@@ -87,9 +88,9 @@ _setup_openslide_dll_path()
 # ============================================================
 
 SUPPORTED_EXTENSIONS = (
-    ".tif", ".tiff", ".ome.tif", ".ome.tiff",
+    ".tif", ".tiff", ".ome.tif", ".ome.tiff", ".qptiff",
     ".svs", ".ndpi", ".mrxs", ".scn", ".vms", ".vmu",
-    ".bif", ".svslide", ".dcm",
+    ".bif", ".svslide", ".dcm", ".vsi",
     ".jpg", ".jpeg", ".png"
 )
 
@@ -99,9 +100,13 @@ OPENSLIDE_EXTENSIONS = (
     ".bif", ".svslide", ".dcm"
 )
 
+# QPTIFF is a TIFF/BigTIFF-family format. It is intentionally handled by
+# tifffile first so channels, dtype and TIFF metadata are not reduced to RGB.
 TIFF_EXTENSIONS = (
-    ".tif", ".tiff", ".ome.tif", ".ome.tiff", ".svs"
+    ".tif", ".tiff", ".ome.tif", ".ome.tiff", ".qptiff", ".svs"
 )
+
+VSI_EXTENSIONS = (".vsi",)
 
 RASTER_EXTENSIONS = (
     ".jpg", ".jpeg", ".png"
@@ -139,7 +144,7 @@ def _image_file_filter():
 
 
 def _tile_file_filter():
-    return "Tile Files (*.tif *.tiff *.ome.tif *.ome.tiff *.jpg *.jpeg *.png);;All Files (*)"
+    return "Tile Files (*.tif *.tiff *.ome.tif *.ome.tiff *.qptiff *.jpg *.jpeg *.png);;All Files (*)"
 
 
 # ============================================================
@@ -176,6 +181,38 @@ def _try_import_pil():
     try:
         from PIL import Image
         return Image
+    except Exception:
+        return None
+
+
+def _try_import_bfio():
+    """Return bfio.BioReader and provision a compatible JDK for Bio-Formats.
+
+    scyjava must be configured before the JVM starts.  Asking cjdk for a full
+    Zulu JDK 17 (rather than a JRE-only runtime) ensures that Java tools such as
+    ``jar`` are available when jgo prepares the Bio-Formats environment.  The
+    runtime is downloaded to the user's cjdk cache on first VSI use and reused
+    afterwards.
+    """
+    try:
+        from scyjava import config as scyjava_config
+        scyjava_config.set_java_constraints(fetch=True, vendor="zulu", version="17")
+        from bfio import BioReader
+        return BioReader
+    except Exception:
+        return None
+
+
+def _bfio_physical_size_um(value):
+    """Convert a BFIO physical-size value/tuple to micrometers per pixel."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (tuple, list)) and len(value) >= 2:
+            return _convert_physical_size_to_um(value[0], value[1])
+        raw_value = getattr(value, "value", value)
+        raw_unit = getattr(value, "unit", getattr(value, "units", "um"))
+        return _convert_physical_size_to_um(raw_value, raw_unit)
     except Exception:
         return None
 
@@ -1001,8 +1038,212 @@ def _human_bytes(n: float) -> str:
     return f"{n:.1f} {units[i]}"
 
 
+# 2.5 GiB is now a warning threshold for large interactive RGB/JPEG crops,
+# not an unconditional stop. TIFF/OME-TIFF can use low-memory chunked paths.
 MAX_INTERACTIVE_CROP_BYTES = 2.5 * 1024 ** 3
 MAX_PREVIEW_CROP_BYTES = 512 * 1024 ** 2
+JPEG_SAFE_MAX_DIMENSION = 65500
+
+# All new PathoImage Toolkit temporary files live inside a per-process session.
+# If the application is killed and normal cleanup cannot run, the next launch
+# removes session directories whose process no longer exists.
+TOOLKIT_TEMP_ROOT = Path(tempfile.gettempdir()) / "PathoImageToolkit"
+_CURRENT_TEMP_SESSION_DIR: Optional[Path] = None
+_TEMP_ATEXIT_REGISTERED = False
+_LAST_STALE_CLEANUP_RESULT: Dict[str, Any] = {"removed": [], "failed": []}
+
+
+class CropCancelledError(RuntimeError):
+    """Raised when the user cancels an active crop/export operation."""
+
+
+def _pid_is_running(pid: int) -> bool:
+    try:
+        pid = int(pid)
+    except Exception:
+        return False
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
+            try:
+                exit_code = ctypes.c_ulong()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return False
+                return int(exit_code.value) == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def _cleanup_stale_temp_sessions() -> Dict[str, Any]:
+    """Remove abandoned Toolkit temp sessions from previous crashed runs.
+
+    New-format session folders carry a session.json with the PID. Legacy temp
+    directories from older builds are only removed when they are at least 24 h
+    old, so another long-running legacy instance is not disturbed.
+    """
+    removed = []
+    failed = []
+    try:
+        TOOLKIT_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return {"removed": removed, "failed": failed}
+
+    for session_dir in list(TOOLKIT_TEMP_ROOT.glob("session_*")):
+        if not session_dir.is_dir():
+            continue
+        pid = None
+        meta_path = session_dir / "session.json"
+        try:
+            if meta_path.exists():
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                pid = int(meta.get("pid")) if meta.get("pid") is not None else None
+        except Exception:
+            pid = None
+        # If metadata is missing/corrupt, a session older than 24 h is stale.
+        if pid is not None:
+            stale = not _pid_is_running(pid)
+        else:
+            try:
+                stale = (time.time() - session_dir.stat().st_mtime) > 24 * 3600
+            except Exception:
+                stale = False
+        if stale:
+            try:
+                shutil.rmtree(session_dir, ignore_errors=False)
+                removed.append(str(session_dir))
+            except Exception as exc:
+                failed.append(f"{session_dir}: {exc}")
+
+    # Best-effort cleanup for temp folders produced by pre-session builds.
+    system_temp = Path(tempfile.gettempdir())
+    cutoff = time.time() - 24 * 3600
+    legacy_dirs = list(system_temp.glob("pathoimage_toolkit_rgb_crop_*")) + list(system_temp.glob("pathoimage_toolkit_pyramid_*"))
+    for path in legacy_dirs:
+        try:
+            if path.is_dir() and path.stat().st_mtime < cutoff:
+                shutil.rmtree(path, ignore_errors=False)
+                removed.append(str(path))
+        except Exception as exc:
+            failed.append(f"{path}: {exc}")
+    legacy_cache = system_temp / "pathoimage_toolkit_preview_cache"
+    if legacy_cache.exists():
+        try:
+            for child in legacy_cache.iterdir():
+                try:
+                    if child.is_file() and child.stat().st_mtime < cutoff:
+                        child.unlink(missing_ok=True)
+                        removed.append(str(child))
+                except Exception as exc:
+                    failed.append(f"{child}: {exc}")
+            if not any(legacy_cache.iterdir()):
+                legacy_cache.rmdir()
+        except Exception:
+            pass
+    return {"removed": removed, "failed": failed}
+
+
+def _cleanup_current_temp_session():
+    global _CURRENT_TEMP_SESSION_DIR
+    session_dir = _CURRENT_TEMP_SESSION_DIR
+    if session_dir is None:
+        return
+    try:
+        shutil.rmtree(session_dir, ignore_errors=True)
+    except Exception:
+        pass
+    _CURRENT_TEMP_SESSION_DIR = None
+
+
+def _ensure_temp_session() -> Path:
+    global _CURRENT_TEMP_SESSION_DIR, _TEMP_ATEXIT_REGISTERED, _LAST_STALE_CLEANUP_RESULT
+    if _CURRENT_TEMP_SESSION_DIR is not None:
+        return _CURRENT_TEMP_SESSION_DIR
+    _LAST_STALE_CLEANUP_RESULT = _cleanup_stale_temp_sessions()
+    TOOLKIT_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_dir = TOOLKIT_TEMP_ROOT / f"session_{stamp}_{os.getpid()}"
+    session_dir.mkdir(parents=True, exist_ok=False)
+    try:
+        (session_dir / "session.json").write_text(
+            json.dumps({
+                "pid": int(os.getpid()),
+                "started": datetime.now().isoformat(timespec="seconds"),
+                "app": APP_NAME,
+                "version": APP_VERSION,
+            }, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+    _CURRENT_TEMP_SESSION_DIR = session_dir
+    if not _TEMP_ATEXIT_REGISTERED:
+        atexit.register(_cleanup_current_temp_session)
+        _TEMP_ATEXIT_REGISTERED = True
+    return session_dir
+
+
+def _new_temp_dir(prefix: str) -> Path:
+    session_dir = _ensure_temp_session()
+    return Path(tempfile.mkdtemp(prefix=prefix, dir=str(session_dir)))
+
+
+def _temp_subdir(name: str) -> Path:
+    path = _ensure_temp_session() / str(name)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _raise_if_cancelled(cancel_callback=None):
+    if cancel_callback is None:
+        return
+    try:
+        cancelled = bool(cancel_callback())
+    except CropCancelledError:
+        raise
+    except Exception:
+        cancelled = False
+    if cancelled:
+        raise CropCancelledError("Crop operation cancelled by user.")
+
+
+def _jpeg_required_downsample(width: int, height: int, max_dimension: int = JPEG_SAFE_MAX_DIMENSION) -> float:
+    """Minimum DS needed so both output dimensions fit the conservative JPEG limit."""
+    width = max(1, int(width))
+    height = max(1, int(height))
+    max_dimension = max(1, int(max_dimension))
+    required = max(1.0, width / float(max_dimension), height / float(max_dimension))
+    # Round upward to 2 decimals and verify after integer output rounding.
+    ds = math.ceil(required * 100.0) / 100.0
+    while (
+        max(1, int(round(float(width) / ds))) > max_dimension
+        or max(1, int(round(float(height) / ds))) > max_dimension
+    ):
+        ds = round(ds + 0.01, 2)
+    return float(ds)
+
+
+def _pyramid_pixel_multiplier(levels: int) -> float:
+    levels = max(1, int(levels or 1))
+    return sum(1.0 / (4.0 ** i) for i in range(levels))
 
 
 def _exception_text(exc: Exception) -> str:
@@ -1187,6 +1428,29 @@ def _estimate_tiff_raw_crop_bytes(backend, x: int, y: int, w: int, h: int, downs
     return _safe_int_product(shape) * np.dtype(dtype).itemsize, shape, axes, np.dtype(dtype)
 
 
+def _estimate_backend_raw_crop_bytes(backend, x: int, y: int, w: int, h: int, downsample: float = 1.0):
+    """Estimate native raw-crop memory for tifffile or Bio-Formats sources."""
+    if backend is None:
+        return None, None, None, None
+    if getattr(backend, "reader", None) == "tifffile":
+        return _estimate_tiff_raw_crop_bytes(backend, x, y, w, h, downsample=downsample)
+    if getattr(backend, "reader", None) == "bioformats":
+        try:
+            br = backend._get_bioreader()
+            ds = max(1.0, float(downsample or 1.0))
+            out_w = max(1, int(round(float(w) / ds)))
+            out_h = max(1, int(round(float(h) / ds)))
+            z = max(1, int(getattr(br, "Z", 1)))
+            c = max(1, int(getattr(br, "C", 1)))
+            t = max(1, int(getattr(br, "T", 1)))
+            dtype = np.dtype(getattr(br, "dtype", np.uint8))
+            shape = (t, c, z, out_h, out_w)
+            return _safe_int_product(shape) * dtype.itemsize, shape, "TCZYX", dtype
+        except Exception:
+            return None, None, None, None
+    return None, None, None, None
+
+
 def _normalize_axes_for_tiff_write(arr_shape, axes: str) -> str:
     axes = (axes or "").strip()
     if axes and len(axes) == len(arr_shape):
@@ -1203,7 +1467,7 @@ def _normalize_axes_for_tiff_write(arr_shape, axes: str) -> str:
 
 def save_tiff_raw_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int, h: int,
                               write_ome: bool = True, lossless: bool = True,
-                              image_name: Optional[str] = None):
+                              image_name: Optional[str] = None, progress_callback=None, cancel_callback=None):
     """Save a raw TIFF/OME-TIFF crop without materializing the full ROI in RAM.
 
     This path is intentionally conservative: it supports no-downsample crops and
@@ -1230,7 +1494,7 @@ def save_tiff_raw_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int
         )
     if za is None:
         try:
-            za = tifffile.memmap(backend.path, series=0)
+            za = tifffile.memmap(backend.path, series=getattr(backend, "_tif_series_index", 0))
         except Exception as exc:
             raise RuntimeError(f"Could not access TIFF pixels by zarr or memmap for low-memory crop: {zarr_error}; {exc}")
 
@@ -1246,7 +1510,14 @@ def save_tiff_raw_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int
 
     def gen_planes():
         iterator_shape = non_spatial_shape if non_spatial_shape else (1,)
+        total_planes = int(np.prod(iterator_shape)) if iterator_shape else 1
+        done_planes = 0
         for idx in np.ndindex(iterator_shape):
+            _raise_if_cancelled(cancel_callback)
+            try:
+                QApplication.processEvents()
+            except Exception:
+                pass
             slicer = []
             for dim_i, ax in enumerate(axes):
                 if ax == "Y":
@@ -1256,6 +1527,12 @@ def save_tiff_raw_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int
                 else:
                     slicer.append(idx[non_spatial_pos[dim_i]] if non_spatial_shape else 0)
             plane = np.asarray(za[tuple(slicer)])
+            done_planes += 1
+            if progress_callback is not None:
+                try:
+                    progress_callback(done_planes, total_planes)
+                except Exception:
+                    pass
             yield np.ascontiguousarray(plane)
 
     metadata = {"axes": axes, "Name": image_name or output_path.stem}
@@ -1264,8 +1541,8 @@ def save_tiff_raw_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int
             metadata.update({
                 "PhysicalSizeX": float(backend.source_mpp[0]),
                 "PhysicalSizeY": float(backend.source_mpp[1]),
-                "PhysicalSizeXUnit": "µm",
-                "PhysicalSizeYUnit": "µm",
+                "PhysicalSizeXUnit": "um",
+                "PhysicalSizeYUnit": "um",
             })
         except Exception:
             pass
@@ -1280,6 +1557,7 @@ def save_tiff_raw_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int
         except Exception:
             pass
     compression_kwargs = {"compression": "deflate", "predictor": True} if lossless else {}
+    _raise_if_cancelled(cancel_callback)
     tifffile.imwrite(
         str(output_path), gen_planes(), shape=out_shape, dtype=dtype,
         bigtiff=True, ome=bool(write_ome), metadata=metadata,
@@ -1298,8 +1576,7 @@ def _read_tiff_series_via_temporary_memmap(series, axes: str, roi: Tuple[int, in
     shape = tuple(getattr(series, "shape", ()) or ())
     dtype = np.dtype(getattr(series, "dtype", np.uint8))
     estimated_bytes = _safe_int_product(shape) * dtype.itemsize if shape else 0
-    cache_dir = Path(tempfile.gettempdir()) / "pathoimage_toolkit_preview_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = _temp_subdir("preview_cache")
     try:
         free_bytes = shutil.disk_usage(str(cache_dir)).free
     except Exception:
@@ -1346,6 +1623,81 @@ def _read_tiff_series_via_temporary_memmap(series, axes: str, roi: Tuple[int, in
             QApplication.processEvents()
         except Exception:
             pass
+
+
+def _tiff_series_spatial_info(series) -> Tuple[int, int, str]:
+    """Return (width, height, axes) for a TIFF series, or (0, 0, axes) if unknown."""
+    axes = str(getattr(series, "axes", "") or "")
+    shape = tuple(getattr(series, "shape", ()) or ())
+    try:
+        if axes and len(axes) == len(shape) and "X" in axes and "Y" in axes:
+            return int(shape[axes.index("X")]), int(shape[axes.index("Y")]), axes
+        if len(shape) >= 2:
+            # Most tifffile series without explicit axes expose spatial dimensions
+            # in the final two positions.
+            return int(shape[-1]), int(shape[-2]), axes
+    except Exception:
+        pass
+    return 0, 0, axes
+
+
+def _select_primary_tiff_series(tif):
+    """Return (series_index, series) for the most likely full-resolution image.
+
+    Vendor TIFF containers such as Akoya QPTIFF can expose multiple TIFF series
+    (main image, label/macro/overview, auxiliary images). Assuming series[0]
+    therefore is not always safe. Prefer the largest spatial series and give a
+    small preference to true pyramidal roots / multichannel data while penalizing
+    obvious label/macro/thumbnail series.
+    """
+    series_list = list(getattr(tif, "series", ()) or ())
+    if not series_list:
+        raise ValueError("No image series found in TIFF/QPTIFF/OME-TIFF.")
+
+    candidates = []
+    for idx, series in enumerate(series_list):
+        w, h, axes = _tiff_series_spatial_info(series)
+        if w <= 0 or h <= 0:
+            continue
+        area = int(w) * int(h)
+        shape = tuple(getattr(series, "shape", ()) or ())
+        levels = getattr(series, "levels", None)
+        level_count = len(levels) if levels is not None else 1
+        name = str(getattr(series, "name", "") or "").lower()
+        kind = str(getattr(series, "kind", "") or "").lower()
+        descriptor = f"{name} {kind}"
+        aux_penalty = 1 if any(
+            token in descriptor
+            for token in ("label", "macro", "thumbnail", "overview", "preview")
+        ) else 0
+        channel_bonus = 0
+        try:
+            if axes and len(axes) == len(shape):
+                if "C" in axes:
+                    channel_bonus = min(32, int(shape[axes.index("C")]))
+                elif "S" in axes:
+                    channel_bonus = min(4, int(shape[axes.index("S")]))
+        except Exception:
+            channel_bonus = 0
+
+        # Area dominates selection. The remaining terms only break plausible ties.
+        score = (
+            area,
+            -aux_penalty,
+            1 if level_count > 1 else 0,
+            channel_bonus,
+            -idx,
+        )
+        candidates.append((score, idx, series))
+
+    if not candidates:
+        # Preserve compatibility for unusual TIFFs whose axes/shape cannot be
+        # interpreted by the heuristic.
+        return 0, series_list[0]
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    _score, index, series = candidates[0]
+    return int(index), series
 
 
 def _open_tiff_zarr_array(series):
@@ -1415,7 +1767,7 @@ def read_preview_array_from_file(path: str, max_side: int = 1200, allow_full_fal
 
     if _has_ext(p.name, TIFF_EXTENSIONS) and not p.name.lower().endswith(".svs"):
         with tifffile.TiffFile(path) as tif:
-            s = tif.series[0]
+            series_index, s = _select_primary_tiff_series(tif)
             axes = getattr(s, "axes", "") or ""
             shape = tuple(s.shape)
             try:
@@ -1478,7 +1830,7 @@ def read_preview_array_from_file(path: str, max_side: int = 1200, allow_full_fal
 
             # Try memory mapping for uncompressed/non-tiled TIFFs.
             try:
-                mm = tifffile.memmap(path, series=0)
+                mm = tifffile.memmap(path, series=series_index)
                 mm_axes = axes if axes and len(axes) == mm.ndim else _guess_axes_for_array(mm, axes)
                 if mm_axes and len(mm_axes) == mm.ndim and "Y" in mm_axes and "X" in mm_axes:
                     y_axis = mm_axes.index("Y")
@@ -1602,7 +1954,7 @@ def _downsample_tiff_raw_lowmem(input_path: Path, output_path: Path, downsample:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with tifffile.TiffFile(str(input_path)) as tif:
-        s = tif.series[0]
+        series_index, s = _select_primary_tiff_series(tif)
         axes = getattr(s, "axes", "") or ""
         if not axes or len(axes) != len(s.shape) or "Y" not in axes or "X" not in axes:
             arr = s.asarray()
@@ -1696,7 +2048,8 @@ def downsample_image_file(input_path: Path, output_dir: Optional[Path], downsamp
         # If the file is a true RGB image stored with a Samples axis, use the visual RGB path instead.
         try:
             with tifffile.TiffFile(str(input_path)) as _tf_check:
-                _axes_check = getattr(_tf_check.series[0], "axes", "") or ""
+                _series_index_check, _series_check = _select_primary_tiff_series(_tf_check)
+                _axes_check = getattr(_series_check, "axes", "") or ""
             _is_rgb_samples = "S" in _axes_check
         except Exception:
             _is_rgb_samples = False
@@ -1747,6 +2100,227 @@ def downsample_image_file(input_path: Path, output_dir: Optional[Path], downsamp
         return out_path
     finally:
         b.close()
+
+
+def _source_base_stem(path: Path) -> str:
+    """Return a clean source stem, removing compound OME-TIFF extensions."""
+    path = Path(path)
+    name = path.name
+    low = name.lower()
+    for ext in (".ome.tiff", ".ome.tif"):
+        if low.endswith(ext):
+            return name[:-len(ext)]
+    return path.stem
+
+
+def _conversion_output_spec(output_kind: str) -> Tuple[str, str, bool]:
+    """Return (extension, format, write_ome) for the converter output choice."""
+    text = str(output_kind or "").upper()
+    if "OME" in text:
+        return ".ome.tif", "tiff", True
+    if "JPEG" in text or "JPG" in text:
+        return ".jpg", "jpeg", False
+    if "PNG" in text:
+        return ".png", "png", False
+    return ".tif", "tiff", False
+
+
+def _format_ds_suffix(ds: float) -> str:
+    ds = max(1.0, float(ds or 1.0))
+    if abs(ds - 1.0) < 1e-9:
+        return ""
+    txt = f"{ds:.2f}".rstrip("0").rstrip(".")
+    return f"_DS{txt}"
+
+
+def _effective_jpeg_downsample(width: int, height: int, requested_ds: float) -> Tuple[float, bool]:
+    """Return a JPEG-safe DS, increasing the requested value only when required."""
+    requested_ds = max(1.0, float(requested_ds or 1.0))
+    required = _jpeg_required_downsample(int(width), int(height))
+    ds = max(requested_ds, required)
+    # Guard against round-to-nearest output dimensions landing one pixel above
+    # the conservative libjpeg limit.
+    while (
+        max(1, int(round(float(width) / ds))) > JPEG_SAFE_MAX_DIMENSION
+        or max(1, int(round(float(height) / ds))) > JPEG_SAFE_MAX_DIMENSION
+    ):
+        ds = math.ceil((ds + 0.001) * 100.0) / 100.0
+    return float(ds), bool(ds > requested_ds + 1e-9)
+
+
+def convert_image_file(input_path: Path, output_dir: Optional[Path], output_kind: str,
+                       downsample: float = 1.0, preserve_raw: bool = False,
+                       lossless: bool = True, overwrite: bool = False,
+                       cancel_callback=None) -> Dict[str, Any]:
+    """Convert one supported image to another format, optionally downsampling.
+
+    JPEG output automatically raises the effective downsample when necessary so
+    neither output axis exceeds ``JPEG_SAFE_MAX_DIMENSION``.  TIFF/OME-TIFF can
+    preserve scientific raw values when explicitly requested and a safe raw path
+    is available; otherwise the converter writes the visual RGB representation.
+    """
+    input_path = Path(input_path)
+    output_dir = input_path.parent if not output_dir else Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    ext, output_format, write_ome = _conversion_output_spec(output_kind)
+    requested_ds = max(1.0, float(downsample or 1.0))
+    backend = ImageBackend().load(str(input_path))
+    temp_path = None
+    try:
+        _raise_if_cancelled(cancel_callback)
+        full_w, full_h = [int(v) for v in backend.slide_dims]
+        effective_ds = requested_ds
+        jpeg_auto_adjusted = False
+        if output_format == "jpeg":
+            effective_ds, jpeg_auto_adjusted = _effective_jpeg_downsample(
+                full_w, full_h, requested_ds
+            )
+
+        base = _source_base_stem(input_path)
+        out_name = f"{base}{_format_ds_suffix(effective_ds)}{ext}"
+        out_path = output_dir / out_name
+
+        # Never overwrite the source file in place, even when overwrite is enabled.
+        try:
+            same_as_source = out_path.resolve() == input_path.resolve()
+        except Exception:
+            same_as_source = str(out_path).lower() == str(input_path).lower()
+        if same_as_source:
+            out_path = output_dir / f"{base}_converted{_format_ds_suffix(effective_ds)}{ext}"
+
+        if out_path.exists() and not overwrite:
+            return {
+                "input": str(input_path), "output": str(out_path), "status": "skipped",
+                "reader": backend.reader, "requested_ds": requested_ds,
+                "effective_ds": effective_ds, "jpeg_auto_adjusted": jpeg_auto_adjusted,
+                "preservation": "existing output kept",
+            }
+
+        # Write to a sibling temporary file and atomically replace the destination
+        # only after the conversion completes successfully.
+        temp_path = out_path.with_name(f"{out_path.stem}.part{out_path.suffix}")
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        preservation = "visual RGB"
+        if output_format == "tiff":
+            # Exact/raw scientific path for TIFF-family input where region access is
+            # available. RGB Sample-axis TIFFs intentionally use the visual RGB path.
+            if preserve_raw and backend.reader == "tifffile":
+                axes = ""
+                try:
+                    _za, series, axes, _zerr = backend._get_tiff_zarr()
+                    axes = axes or getattr(series, "axes", "") or ""
+                except Exception:
+                    axes = ""
+                if "S" not in axes:
+                    if abs(effective_ds - 1.0) < 1e-9:
+                        save_tiff_raw_crop_lowmem(
+                            backend, temp_path, 0, 0, full_w, full_h,
+                            write_ome=write_ome, lossless=lossless,
+                            image_name=base, cancel_callback=cancel_callback,
+                        )
+                    else:
+                        _downsample_tiff_raw_lowmem(
+                            input_path, temp_path, effective_ds,
+                            write_ome=write_ome, lossless=lossless,
+                            source_resolution=backend.source_resolution,
+                            source_mpp=backend.source_mpp,
+                        )
+                    preservation = "raw scientific TIFF data"
+                else:
+                    save_rgb_crop_lowmem(
+                        backend, temp_path, 0, 0, full_w, full_h,
+                        downsample=effective_ds, output_format="tiff",
+                        write_ome=write_ome, lossless=lossless,
+                        source_resolution=backend.source_resolution,
+                        source_mpp=backend.source_mpp, image_name=base,
+                        chunk_size=max(32, int(2048 / max(1.0, effective_ds))),
+                        pyramid_levels=1, cancel_callback=cancel_callback,
+                    )
+                    preservation = "RGB samples preserved visually"
+            elif preserve_raw and backend.reader == "bioformats":
+                estimated, _shape, _axes, _dtype = _estimate_backend_raw_crop_bytes(
+                    backend, 0, 0, full_w, full_h, downsample=effective_ds
+                )
+                # BFIO raw reads currently materialize the requested stack. Keep this
+                # path conservative; for large VSI, users can uncheck raw preservation
+                # and use the memory-light RGB converter instead.
+                if estimated is not None and estimated <= MAX_PREVIEW_CROP_BYTES:
+                    raw, axes, _info = backend.crop_raw(0, 0, full_w, full_h)
+                    if effective_ds > 1.0:
+                        raw, axes = _resize_spatial_array(raw, axes, effective_ds)
+                    save_multichannel_image(
+                        temp_path, raw, axes=axes, write_ome=write_ome,
+                        lossless=lossless, source_resolution=backend.source_resolution,
+                        source_mpp=backend.source_mpp, image_name=base,
+                        pixel_scale=effective_ds, cancel_callback=cancel_callback,
+                    )
+                    preservation = "raw Bio-Formats channels"
+                else:
+                    raise RuntimeError(
+                        "Raw multichannel VSI conversion would require too much memory for the current "
+                        "BFIO path. Disable 'Preserve raw channels' to convert the visual RGB image, "
+                        "or crop/tile the VSI first."
+                    )
+            else:
+                save_rgb_crop_lowmem(
+                    backend, temp_path, 0, 0, full_w, full_h,
+                    downsample=effective_ds, output_format="tiff",
+                    write_ome=write_ome, lossless=lossless,
+                    source_resolution=backend.source_resolution,
+                    source_mpp=backend.source_mpp, image_name=base,
+                    chunk_size=max(32, int(2048 / max(1.0, effective_ds))),
+                    pyramid_levels=1, cancel_callback=cancel_callback,
+                )
+        else:
+            rgb, _meta = _read_visual_crop_for_save(
+                backend, 0, 0, full_w, full_h, downsample=effective_ds
+            )
+            _raise_if_cancelled(cancel_callback)
+            if output_format == "jpeg":
+                save_rgb_image(
+                    temp_path, rgb, output_format="jpeg", write_ome=False,
+                    lossless=False, source_resolution=backend.source_resolution,
+                    source_mpp=backend.source_mpp, image_name=base,
+                    pixel_scale=effective_ds, cancel_callback=cancel_callback,
+                )
+            else:
+                from PIL import Image
+                save_kwargs = {"format": "PNG"}
+                scaled_resolution, _scaled_mpp = _scale_resolution_and_mpp(
+                    backend.source_resolution, backend.source_mpp, effective_ds
+                )
+                if scaled_resolution is not None:
+                    try:
+                        xres, yres, unit = scaled_resolution
+                        if str(unit).upper() == "INCH":
+                            save_kwargs["dpi"] = (float(xres), float(yres))
+                    except Exception:
+                        pass
+                Image.fromarray(_to_uint8_rgb(rgb)).save(str(temp_path), **save_kwargs)
+
+        _raise_if_cancelled(cancel_callback)
+        if out_path.exists() and overwrite:
+            out_path.unlink()
+        os.replace(str(temp_path), str(out_path))
+        temp_path = None
+        return {
+            "input": str(input_path), "output": str(out_path), "status": "success",
+            "reader": backend.reader, "requested_ds": requested_ds,
+            "effective_ds": effective_ds, "jpeg_auto_adjusted": jpeg_auto_adjusted,
+            "preservation": preservation,
+        }
+    finally:
+        backend.close()
+        if temp_path is not None:
+            try:
+                Path(temp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 # ============================================================
@@ -3901,7 +4475,7 @@ def read_zoom_region_from_file(path: str, center_xy=None, zoom: float = 1.0,
 
     if _has_ext(p.name, TIFF_EXTENSIONS) and not p.name.lower().endswith(".svs"):
         with tifffile.TiffFile(path) as tif:
-            s0 = tif.series[0]
+            series_index, s0 = _select_primary_tiff_series(tif)
             axes = getattr(s0, "axes", "") or ""
             shape = tuple(s0.shape)
             if axes and len(axes) == len(shape) and "Y" in axes and "X" in axes:
@@ -3935,7 +4509,7 @@ def read_zoom_region_from_file(path: str, center_xy=None, zoom: float = 1.0,
 
             # Try memory mapping for uncompressed/non-tiled TIFFs.
             try:
-                mm = tifffile.memmap(path, series=0)
+                mm = tifffile.memmap(path, series=series_index)
                 mm_axes = axes if axes and len(axes) == mm.ndim else _guess_axes_for_array(mm, axes)
                 if mm_axes and len(mm_axes) == mm.ndim and "Y" in mm_axes and "X" in mm_axes:
                     slicer = []
@@ -4267,6 +4841,10 @@ def read_zoom_region_from_backend(backend, center_xy=None, zoom: float = 1.0,
         arr = np.asarray(slide.read_region((int(x), int(y)), int(level), (lw, lh)).convert("RGB"), dtype=np.uint8)
         return arr, "YXS", {**meta, "reader": "openslide-cached-region", "level": int(level), "step": ds}
 
+    if backend.reader == "bioformats":
+        arr, axes, bmeta = backend._bioformats_preview_region(roi, max_side=max_side)
+        return arr, axes, {**meta, **(bmeta or {})}
+
     if backend.reader == "tifffile":
         # Fast preview path for OME-TIFF/TIFF: open the TIFF directory only,
         # then try pyramid/overview levels BEFORE constructing a full-resolution
@@ -4275,7 +4853,7 @@ def read_zoom_region_from_backend(backend, center_xy=None, zoom: float = 1.0,
         # immediately usable for thumbnails and low-zoom previews.
         if getattr(backend, "_tif_obj", None) is None:
             backend._tif_obj = tifffile.TiffFile(backend.path)
-            backend._tif_series = backend._tif_obj.series[0]
+            backend._tif_series_index, backend._tif_series = _select_primary_tiff_series(backend._tif_obj)
             backend._tif_axes = getattr(backend._tif_series, "axes", "") or ""
             backend._zarr_array = None
             backend._zarr_error = None
@@ -4315,7 +4893,7 @@ def read_zoom_region_from_backend(backend, center_xy=None, zoom: float = 1.0,
 
         # 3) Try memory mapping for uncompressed/non-tiled TIFFs without reading the full image.
         try:
-            mm = tifffile.memmap(backend.path, series=0)
+            mm = tifffile.memmap(backend.path, series=getattr(backend, "_tif_series_index", 0))
             mm_axes = axes if axes and len(axes) == mm.ndim else _guess_axes_for_array(mm, axes)
             arr, out_axes = _slice_preview_zarr_region(mm, mm_axes, roi, step=step, level_downsample=1.0)
             return arr, out_axes, {**meta, "reader": "tifffile-memmap-cached-region", "shape": shape, "axes": mm_axes, "step": step}
@@ -4403,13 +4981,17 @@ def read_roi_region_from_backend(backend, roi_full: Tuple[int, int, int, int], m
         arr = np.asarray(slide.read_region((int(x), int(y)), int(level), (lw, lh)).convert("RGB"), dtype=np.uint8)
         return arr, "YXS", {**meta, "reader": "openslide-cached-roi-preview", "level": int(level), "step": ds}
 
+    if backend.reader == "bioformats":
+        arr, axes, bmeta = backend._bioformats_preview_region(roi, max_side=max_side)
+        return arr, axes, {**meta, **(bmeta or {})}
+
     if backend.reader == "tifffile":
         # Do not call _get_tiff_zarr first. That can touch the full-resolution
         # image and be very slow for large compressed OME-TIFFs. Open the TIFF
         # directory, try overview/pyramid levels first, then fall back to zarr.
         if getattr(backend, "_tif_obj", None) is None:
             backend._tif_obj = tifffile.TiffFile(backend.path)
-            backend._tif_series = backend._tif_obj.series[0]
+            backend._tif_series_index, backend._tif_series = _select_primary_tiff_series(backend._tif_obj)
             backend._tif_axes = getattr(backend._tif_series, "axes", "") or ""
             backend._zarr_array = None
             backend._zarr_error = None
@@ -4446,7 +5028,7 @@ def read_roi_region_from_backend(backend, roi_full: Tuple[int, int, int, int], m
             return arr, out_axes, {**meta, "reader": "tifffile-zarr-cached-roi-preview", "shape": shape, "axes": axes, "step": step}
 
         try:
-            mm = tifffile.memmap(backend.path, series=0)
+            mm = tifffile.memmap(backend.path, series=getattr(backend, "_tif_series_index", 0))
             mm_axes = axes if axes and len(axes) == mm.ndim else _guess_axes_for_array(mm, axes)
             arr, out_axes = _slice_preview_zarr_region(mm, mm_axes, roi, step=step, level_downsample=1.0)
             return arr, out_axes, {**meta, "reader": "tifffile-memmap-cached-roi-preview", "shape": shape, "axes": mm_axes, "step": step}
@@ -4698,12 +5280,18 @@ class ImageBackend:
         self._os_level_dimensions = None
         self._tif_obj = None
         self._tif_series = None
+        self._tif_series_index = 0
         self._tif_axes = None
         self._zarr_array = None
         self._zarr_error = None
         self._decoded_memmap = None
         self._decoded_memmap_path = None
         self._decoded_memmap_axes = None
+        self._bio_reader = None
+        self._bio_shape = None
+        self._bio_dtype = None
+        self._bio_channel_names = []
+        self._bio_level_dims = None
 
     def load(self, path: str):
         # Close any cached reader before loading a new file.
@@ -4723,24 +5311,29 @@ class ImageBackend:
         self._os_level_dimensions = None
         self._tif_obj = None
         self._tif_series = None
+        self._tif_series_index = 0
         self._tif_axes = None
         self._zarr_array = None
         self._zarr_error = None
         self._decoded_memmap = None
         self._decoded_memmap_path = None
         self._decoded_memmap_axes = None
+        self._bio_reader = None
+        self._bio_shape = None
+        self._bio_dtype = None
+        self._bio_channel_names = []
+        self._bio_level_dims = None
 
         lower_name = self.path_obj.name.lower()
 
-        # OME-TIFF and scientific multichannel TIFFs should prefer tifffile.
-        # OpenSlide may open some OME-TIFFs as generic TIFFs but then lose the
-        # OME axes and physical pixel size; crops saved afterwards may appear as
-        # 1 µm/px.  For .ome.tif/.ome.tiff, preserve scientific metadata first.
-        if _is_ome_tiff_name(lower_name) and _has_ext(lower_name, TIFF_EXTENSIONS):
+        # OME-TIFF/QPTIFF and scientific multichannel TIFFs should prefer tifffile.
+        # OpenSlide may open some TIFF-family files as generic RGB slides but then
+        # lose scientific axes, dtype, channels or physical calibration.
+        if (_is_ome_tiff_name(lower_name) or lower_name.endswith(".qptiff")) and _has_ext(lower_name, TIFF_EXTENSIONS):
             try:
                 w, h, res, mpp = self._probe_tifffile(path)
                 self.reader = "tifffile"
-                self.file_kind = "tiff"
+                self.file_kind = "qptiff" if lower_name.endswith(".qptiff") else "tiff"
                 self.slide_dims = (int(w), int(h))
                 self.source_resolution = res
                 self.source_mpp = mpp
@@ -4748,6 +5341,22 @@ class ImageBackend:
                 return self
             except Exception as e:
                 self._fail_log.append(("tifffile", str(e)))
+
+        # Olympus/Evident cellSens VSI is not a TIFF file even though its pixel
+        # payload can live in associated ETS data. Use the optional Bio-Formats
+        # backend and keep the .vsi beside its associated folders/files.
+        if _has_ext(lower_name, VSI_EXTENSIONS):
+            try:
+                w, h, res, mpp, props = self._probe_bioformats(path)
+                self.reader = "bioformats"
+                self.file_kind = "vsi"
+                self.slide_dims = (int(w), int(h))
+                self.source_resolution = res
+                self.source_mpp = mpp
+                self.openslide_props = props or {}
+                return self
+            except Exception as e:
+                self._fail_log.append(("Bio-Formats/BFIO", str(e)))
 
         if _has_ext(lower_name, OPENSLIDE_EXTENSIONS):
             try:
@@ -4801,8 +5410,12 @@ class ImageBackend:
             "- Install OpenSlide support:\n"
             "  pip install openslide-python openslide-bin\n\n"
             "- For MRXS, make sure the .mrxs file is beside its associated data folder.\n"
-            "- For TIFF/OME-TIFF, make sure tifffile and zarr are installed:\n"
-            "  pip install tifffile zarr\n"
+            "- For TIFF/OME-TIFF/QPTIFF, make sure tifffile, zarr and imagecodecs are installed:\n"
+            "  pip install tifffile zarr imagecodecs\n\n"
+            "- For Olympus/Evident VSI, install the optional Bio-Formats backend:\n"
+            "  pip install bfio\n"
+            "  The bfio Bio-Formats backend also requires a working Java/JDK setup.\n"
+            "  Keep the .vsi file together with its associated ETS/data folder.\n"
         )
         raise RuntimeError("\n".join(msg))
 
@@ -4818,6 +5431,15 @@ class ImageBackend:
             except Exception:
                 pass
         self._openslide_obj = None
+
+        if getattr(self, "_bio_reader", None) is not None:
+            try:
+                self._bio_reader.close()
+            except Exception:
+                pass
+        self._bio_reader = None
+        self._bio_level_dims = None
+
         if getattr(self, "_tif_obj", None) is not None:
             try:
                 self._tif_obj.close()
@@ -4825,6 +5447,7 @@ class ImageBackend:
                 pass
         self._tif_obj = None
         self._tif_series = None
+        self._tif_series_index = 0
         self._tif_axes = None
         self._zarr_array = None
         self._zarr_error = None
@@ -4887,7 +5510,7 @@ class ImageBackend:
         """
         if self._tif_obj is None:
             self._tif_obj = tifffile.TiffFile(self.path)
-            self._tif_series = self._tif_obj.series[0]
+            self._tif_series_index, self._tif_series = _select_primary_tiff_series(self._tif_obj)
             self._tif_axes = getattr(self._tif_series, "axes", "") or ""
             self._zarr_array = None
             self._zarr_error = None
@@ -4917,7 +5540,7 @@ class ImageBackend:
 
         if self._tif_obj is None:
             self._tif_obj = tifffile.TiffFile(self.path)
-            self._tif_series = self._tif_obj.series[0]
+            self._tif_series_index, self._tif_series = _select_primary_tiff_series(self._tif_obj)
             self._tif_axes = getattr(self._tif_series, "axes", "") or ""
 
         series = self._tif_series
@@ -4926,8 +5549,7 @@ class ImageBackend:
         dtype = np.dtype(getattr(series, "dtype", np.uint8))
         estimated_bytes = _safe_int_product(shape) * dtype.itemsize if shape else 0
 
-        cache_dir = Path(tempfile.gettempdir()) / "pathoimage_toolkit_preview_cache"
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir = _temp_subdir("preview_cache")
         try:
             free_bytes = shutil.disk_usage(str(cache_dir)).free
         except Exception:
@@ -4960,6 +5582,219 @@ class ImageBackend:
         if Image is None:
             raise RuntimeError("PIL/Pillow is not installed. Install with: pip install pillow")
         return np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8)
+
+    def _new_bioreader(self, level: int = 0):
+        """Open BFIO's Bio-Formats reader for VSI or another Bio-Formats source."""
+        BioReader = _try_import_bfio()
+        if BioReader is None:
+            raise RuntimeError(
+                "Olympus/Evident VSI requires the optional 'bfio' package.\n\n"
+                "Install it in the same Python environment used by PathoImage Toolkit:\n"
+                "    pip install bfio\n\n"
+                "The BFIO Bio-Formats backend uses scyjava/cjdk to provision a Zulu JDK 17 "
+                "on first use, so an internet connection may be required the first time. "
+                "Keep the .vsi file beside its associated ETS/data folder."
+            )
+        try:
+            return BioReader(str(self.path), backend="bioformats", level=int(level))
+        except TypeError as exc:
+            # BFIO releases before multiresolution 'level=' support can still open
+            # level 0, but are not suitable for efficient WSI/VSI overview reads.
+            if int(level) == 0:
+                return BioReader(str(self.path), backend="bioformats")
+            raise RuntimeError(
+                "The installed bfio version does not support multiresolution 'level=' access. "
+                "Upgrade bfio to a current release before using large pyramidal VSI files."
+            ) from exc
+
+    def _get_bioreader(self):
+        if self._bio_reader is None:
+            self._bio_reader = self._new_bioreader(level=0)
+            try:
+                self._bio_shape = tuple(self._bio_reader.shape)
+            except Exception:
+                self._bio_shape = (
+                    int(self._bio_reader.Y), int(self._bio_reader.X),
+                    int(getattr(self._bio_reader, "Z", 1)),
+                    int(getattr(self._bio_reader, "C", 1)),
+                    int(getattr(self._bio_reader, "T", 1)),
+                )
+            try:
+                self._bio_dtype = np.dtype(self._bio_reader.dtype)
+            except Exception:
+                self._bio_dtype = np.dtype(np.uint8)
+            try:
+                self._bio_channel_names = list(self._bio_reader.channel_names or [])
+            except Exception:
+                self._bio_channel_names = []
+        return self._bio_reader
+
+    def _probe_bioformats(self, path: str):
+        """Probe a VSI through BFIO/Bio-Formats without reading full-resolution pixels."""
+        original_path = self.path
+        self.path = str(path)
+        br = None
+        try:
+            br = self._new_bioreader(level=0)
+            w = int(br.X)
+            h = int(br.Y)
+            if w <= 0 or h <= 0:
+                raise ValueError(f"Bio-Formats returned invalid VSI dimensions: {w} x {h}")
+
+            psx = _bfio_physical_size_um(getattr(br, "physical_size_x", None))
+            psy = _bfio_physical_size_um(getattr(br, "physical_size_y", None))
+            mpp = (float(psx), float(psy)) if psx and psy and psx > 0 and psy > 0 else None
+            res_tuple = _mpp_to_resolution_tuple(mpp[0], mpp[1]) if mpp else None
+            try:
+                shape = tuple(br.shape)
+            except Exception:
+                shape = (h, w, int(getattr(br, "Z", 1)), int(getattr(br, "C", 1)), int(getattr(br, "T", 1)))
+            try:
+                dtype_text = str(np.dtype(br.dtype))
+            except Exception:
+                dtype_text = "unknown"
+            props = {
+                "bioformats.reader": "BFIO/Bio-Formats",
+                "bioformats.shape_yxzct": str(shape),
+                "bioformats.dtype": dtype_text,
+                "bioformats.channels": str(int(getattr(br, "C", 1))),
+                "bioformats.z": str(int(getattr(br, "Z", 1))),
+                "bioformats.t": str(int(getattr(br, "T", 1))),
+            }
+            return w, h, res_tuple, mpp, props
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not open this VSI through BFIO/Bio-Formats.\n\n"
+                "Verify that 'bfio' and Java/JDK are installed in the same environment, "
+                "and that the .vsi file remains beside its associated ETS/data folder.\n\n"
+                f"Original error: {exc}"
+            ) from exc
+        finally:
+            if br is not None:
+                try:
+                    br.close()
+                except Exception:
+                    pass
+            self.path = original_path if original_path is not None else str(path)
+
+    @staticmethod
+    def _bioformats_yxc_from_read(arr: np.ndarray) -> Tuple[np.ndarray, str]:
+        """Convert BFIO YXZCT output to a representative YX/YXC display plane."""
+        arr = np.asarray(arr)
+        # BioReader.read() normally returns Y, X, Z, C, T.
+        if arr.ndim == 5:
+            arr = arr[:, :, 0, :, 0]
+        elif arr.ndim == 4:
+            # Be conservative: keep Y/X, first Z-like axis, final channel-like axis.
+            arr = arr[:, :, 0, :]
+        arr = np.squeeze(arr)
+        if arr.ndim == 2:
+            return arr, "YX"
+        if arr.ndim == 3:
+            if arr.shape[-1] >= 1:
+                return arr, "YXC"
+        return arr, _guess_axes_for_array(arr)
+
+    def _bioformats_level_dimensions(self, max_levels: int = 12) -> List[Tuple[int, int, int]]:
+        """Discover usable VSI pyramid levels as (level, width, height)."""
+        if self._bio_level_dims is not None:
+            return list(self._bio_level_dims)
+
+        full_w, full_h = self.slide_dims or (0, 0)
+        levels = [(0, int(full_w), int(full_h))]
+        previous = (int(full_w), int(full_h))
+        for level in range(1, max(1, int(max_levels))):
+            br = None
+            try:
+                br = self._new_bioreader(level=level)
+                dims = (int(br.X), int(br.Y))
+                if dims[0] <= 0 or dims[1] <= 0 or dims == previous or dims == (int(full_w), int(full_h)):
+                    break
+                # A pyramid level should not grow relative to the previous level.
+                if dims[0] > previous[0] or dims[1] > previous[1]:
+                    break
+                levels.append((int(level), dims[0], dims[1]))
+                previous = dims
+                if max(dims) <= 256:
+                    break
+            except Exception:
+                break
+            finally:
+                if br is not None:
+                    try:
+                        br.close()
+                    except Exception:
+                        pass
+        self._bio_level_dims = levels
+        return list(levels)
+
+    def _bioformats_preview_region(self, roi, max_side: int = 1200):
+        """Read a display region from the closest useful VSI pyramid level."""
+        full_w, full_h = self.slide_dims
+        x, y, w, h = [int(v) for v in roi]
+        target_ds = max(1.0, max(float(w), float(h)) / float(max(1, max_side)))
+        levels = self._bioformats_level_dimensions()
+
+        def level_score(item):
+            _level, lw, lh = item
+            ds = max(float(full_w) / max(1.0, float(lw)), float(full_h) / max(1.0, float(lh)))
+            return abs(math.log(max(ds, 1e-9) / max(target_ds, 1e-9)))
+
+        level, level_w, level_h = min(levels, key=level_score)
+        scale_x = float(level_w) / float(full_w)
+        scale_y = float(level_h) / float(full_h)
+        lx0 = max(0, min(int(math.floor(x * scale_x)), max(0, level_w - 1)))
+        ly0 = max(0, min(int(math.floor(y * scale_y)), max(0, level_h - 1)))
+        lx1 = max(lx0 + 1, min(int(math.ceil((x + w) * scale_x)), level_w))
+        ly1 = max(ly0 + 1, min(int(math.ceil((y + h) * scale_y)), level_h))
+
+        br = self._get_bioreader() if int(level) == 0 else self._new_bioreader(level=int(level))
+        close_after = int(level) != 0
+        try:
+            raw = br.read(X=[lx0, lx1], Y=[ly0, ly1], Z=0, C=None, T=0)
+            arr, axes = self._bioformats_yxc_from_read(raw)
+            rgb = _array_to_rgb_preview(arr, axes)
+            rgb = _downsample_for_preview(rgb, max_side=max_side)
+            ds = max(float(full_w) / max(1.0, float(level_w)), float(full_h) / max(1.0, float(level_h)))
+            return rgb, "YXS", {
+                "reader": "bioformats-vsi-region",
+                "level": int(level),
+                "step": float(ds),
+                "level_dims": (int(level_w), int(level_h)),
+                "coordinate_space": "full-resolution image pixels",
+            }
+        finally:
+            if close_after:
+                try:
+                    br.close()
+                except Exception:
+                    pass
+
+    def _crop_bioformats(self, x: int, y: int, w: int, h: int):
+        br = self._get_bioreader()
+        raw = br.read(X=[int(x), int(x + w)], Y=[int(y), int(y + h)], Z=0, C=None, T=0)
+        arr, axes = self._bioformats_yxc_from_read(raw)
+        return _array_to_rgb_preview(arr, axes), {"used": False, "reader": "bioformats-vsi-level0"}
+
+    def _crop_bioformats_raw(self, x: int, y: int, w: int, h: int):
+        """Read a full-fidelity VSI ROI as TCZYX without display normalization."""
+        br = self._get_bioreader()
+        raw = np.asarray(
+            br.read(X=[int(x), int(x + w)], Y=[int(y), int(y + h)], Z=None, C=None, T=None)
+        )
+        if raw.ndim != 5:
+            # BFIO documents read() as YXZCT. Pad singleton trailing dimensions
+            # defensively for unusual readers.
+            while raw.ndim < 5:
+                raw = np.expand_dims(raw, axis=-1)
+        if raw.ndim != 5:
+            raise RuntimeError(f"Unexpected BFIO VSI array shape: {raw.shape}")
+        arr = np.transpose(raw, (4, 3, 2, 0, 1))  # YXZCT -> TCZYX
+        return np.ascontiguousarray(arr), "TCZYX", {
+            "used": False,
+            "reader": "bioformats-vsi-level0-raw",
+            "source_axes": "YXZCT",
+        }
 
     def _probe_openslide(self, path: str):
         openslide = _try_import_openslide()
@@ -5015,7 +5850,7 @@ class ImageBackend:
             except Exception:
                 ome_mpp = None
 
-            s0 = tif.series[0]
+            _series_index, s0 = _select_primary_tiff_series(tif)
             shape0 = s0.shape
             axes = getattr(s0, "axes", "")
             if "X" in axes and "Y" in axes:
@@ -5087,6 +5922,8 @@ class ImageBackend:
             return self._crop_openslide_robust(x, y, w, h, fill=fill)
         if self.reader == "tifffile":
             return self._crop_tifffile(self.path, x, y, w, h)
+        if self.reader == "bioformats":
+            return self._crop_bioformats(x, y, w, h)
         if self.reader == "pil":
             arr = self._read_with_pil(self.path)
             return _to_uint8_rgb(arr[y:y+h, x:x+w, :]), {"used": False}
@@ -5104,6 +5941,8 @@ class ImageBackend:
         x, y, w, h = self.clip_roi(x, y, w, h, full_w, full_h)
         if self.reader == "tifffile":
             return self._crop_tifffile_raw(self.path, x, y, w, h)
+        if self.reader == "bioformats":
+            return self._crop_bioformats_raw(x, y, w, h)
         # OpenSlide and PIL are visual/RGB readers in this application.
         rgb, info = self.crop(x, y, w, h, fill=255)
         return rgb, "YXS", info
@@ -5336,6 +6175,13 @@ class ImageBackend:
             arr, axes, _meta = read_preview_array_from_file(self.path, max_side=max_side)
             return _array_to_rgb_preview(arr, axes)
 
+        if self.reader == "bioformats":
+            rgb, _axes, _meta = self._bioformats_preview_region(
+                (0, 0, int(self.slide_dims[0]), int(self.slide_dims[1])),
+                max_side=max_side,
+            )
+            return _to_uint8_rgb(rgb)
+
         raise RuntimeError(f"Unknown reader: {self.reader}")
 
 
@@ -5417,7 +6263,7 @@ def _close_and_remove_memmap(arr, path: Optional[Path]):
             pass
 
 
-def _half_downsample_to_memmap(src, axes: str, output_path: Path, chunk_rows: int = 128):
+def _half_downsample_to_memmap(src, axes: str, output_path: Path, chunk_rows: int = 128, cancel_callback=None):
     """Create a half-resolution array on disk with bounded RAM use.
 
     Spatial Y/X dimensions are reduced by 2 using a 2x2 box average. All other
@@ -5451,6 +6297,11 @@ def _half_downsample_to_memmap(src, axes: str, output_path: Path, chunk_rows: in
             out_base[axis] = int(value)
 
         for oy0 in range(0, out_h, chunk_rows):
+            _raise_if_cancelled(cancel_callback)
+            try:
+                QApplication.processEvents()
+            except Exception:
+                pass
             oy1 = min(out_h, oy0 + chunk_rows)
             sy0 = oy0 * 2
             sy1 = min(in_h, oy1 * 2)
@@ -5513,7 +6364,7 @@ def _write_pyramidal_tiff(output_path: Path, arr, axes: str, write_ome: bool,
                            photometric: str, resolution=None, resolutionunit=None,
                            description: Optional[str] = None,
                            requested_levels: int = PYRAMID_TOTAL_LEVELS,
-                           low_memory_levels: bool = False) -> int:
+                           low_memory_levels: bool = False, cancel_callback=None) -> int:
     """Write a tiled TIFF/OME-TIFF pyramid with up to eight total levels."""
     output_path = Path(output_path)
     arr = np.asarray(arr)
@@ -5521,10 +6372,11 @@ def _write_pyramidal_tiff(output_path: Path, arr, axes: str, write_ome: bool,
     level_count = _effective_pyramid_levels(arr.shape, axes, requested_levels)
     compression_kwargs = {"compression": "deflate", "predictor": True} if lossless else {}
 
-    temp_dir = Path(tempfile.mkdtemp(prefix="pathoimage_toolkit_pyramid_")) if low_memory_levels and level_count > 1 else None
+    temp_dir = _new_temp_dir("pyramid_") if low_memory_levels and level_count > 1 else None
     current = arr
     current_temp = None
     try:
+        _raise_if_cancelled(cancel_callback)
         with tifffile.TiffWriter(str(output_path), bigtiff=True, ome=bool(write_ome)) as tif:
             first_kwargs = dict(
                 photometric=photometric,
@@ -5541,9 +6393,14 @@ def _write_pyramidal_tiff(output_path: Path, arr, axes: str, write_ome: bool,
             tif.write(current, **first_kwargs)
 
             for level_index in range(1, level_count):
+                _raise_if_cancelled(cancel_callback)
+                try:
+                    QApplication.processEvents()
+                except Exception:
+                    pass
                 if low_memory_levels:
                     next_path = temp_dir / f"level_{level_index}.npy"
-                    next_arr, _ = _half_downsample_to_memmap(current, axes, next_path)
+                    next_arr, _ = _half_downsample_to_memmap(current, axes, next_path, cancel_callback=cancel_callback)
                 else:
                     next_arr, _ = _resize_spatial_array(current, axes, downsample=2.0)
                     next_path = None
@@ -5584,7 +6441,7 @@ def _write_pyramidal_tiff(output_path: Path, arr, axes: str, write_ome: bool,
 
 def save_rgb_image(output_path, rgb, output_format="tiff", write_ome=False, lossless=True,
                    source_resolution=None, source_mpp=None, image_name=None, annotation_kv=None,
-                   pixel_scale=1.0, pyramid_levels: int = 1):
+                   pixel_scale=1.0, pyramid_levels: int = 1, cancel_callback=None):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     rgb = _to_uint8_rgb(rgb)
@@ -5619,14 +6476,33 @@ def save_rgb_image(output_path, rgb, output_format="tiff", write_ome=False, loss
             mpp_x_um = None
             mpp_y_um = None
 
+    _raise_if_cancelled(cancel_callback)
+
     if output_format == "jpeg":
+        out_h, out_w = int(rgb.shape[0]), int(rgb.shape[1])
+        if out_w > JPEG_SAFE_MAX_DIMENSION or out_h > JPEG_SAFE_MAX_DIMENSION:
+            extra_ds = _jpeg_required_downsample(out_w, out_h)
+            raise RuntimeError(
+                "This image cannot be written as one JPEG at the requested resolution.\n\n"
+                f"Current output size: {out_w:,} × {out_h:,} px\n"
+                f"Maximum supported JPEG dimension: {JPEG_SAFE_MAX_DIMENSION:,} px per axis\n"
+                f"Minimum additional downsample required from this output: {extra_ds:g}×\n\n"
+                "For Crop, choose the suggested Downsample shown before saving. "
+                "If full resolution must be preserved, save as TIFF/OME-TIFF or use JPEG Tiles mode."
+            )
         from PIL import Image
         save_kwargs = {"quality": 95}
         # JPEG can store DPI. It cannot store full OME physical-size metadata,
         # but adding DPI is still better than dropping calibration completely.
         if resolution is not None and resolutionunit == "INCH":
             save_kwargs["dpi"] = (float(resolution[0]), float(resolution[1]))
-        Image.fromarray(rgb).save(str(output_path), **save_kwargs)
+        try:
+            Image.fromarray(rgb).save(str(output_path), **save_kwargs)
+        except OSError as exc:
+            # Pillow/libjpeg often reports only "broken data stream" for a failed
+            # giant JPEG. The dimension preflight above makes the common size
+            # failure explicit; preserve the original I/O error otherwise.
+            raise RuntimeError(f"JPEG encoder/write failed: {exc}") from exc
         return
 
     compression_kwargs = {"compression": "deflate", "predictor": True} if lossless else {}
@@ -5660,6 +6536,7 @@ def save_rgb_image(output_path, rgb, output_format="tiff", write_ome=False, loss
             description=f"Generated by {APP_NAME} v{APP_VERSION}; pyramidal TIFF with {int(pyramid_levels)} requested levels",
             requested_levels=int(pyramid_levels),
             low_memory_levels=False,
+            cancel_callback=cancel_callback,
         )
         return
 
@@ -5693,7 +6570,7 @@ def save_rgb_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int, h: 
                          source_resolution=None, source_mpp=None, image_name: Optional[str] = None,
                          annotation_kv: Optional[Dict[str, Any]] = None,
                          chunk_size: int = 2048, progress_callback=None,
-                         pyramid_levels: int = 1) -> Dict[str, Any]:
+                         pyramid_levels: int = 1, cancel_callback=None) -> Dict[str, Any]:
     """Save a large visual RGB crop using disk-backed chunks instead of one huge RAM array.
 
     This is intended for large H&E/RGB-style crops where a single array could be
@@ -5721,7 +6598,7 @@ def save_rgb_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int, h: 
     x, y, w, h = backend.clip_roi(int(x), int(y), int(w), int(h), int(full_w), int(full_h))
     out_w = max(1, int(round(float(w) / ds)))
     out_h = max(1, int(round(float(h) / ds)))
-    chunk_size = max(256, int(chunk_size or 2048))
+    chunk_size = max(32, int(chunk_size or 2048))
 
     # Calibration metadata must describe the output pixels after downsampling.
     source_resolution, source_mpp = _scale_resolution_and_mpp(
@@ -5756,18 +6633,26 @@ def save_rgb_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int, h: 
             mpp_x_um = None
             mpp_y_um = None
 
-    temp_dir = tempfile.mkdtemp(prefix="pathoimage_toolkit_rgb_crop_")
+    temp_dir = _new_temp_dir("rgb_crop_")
     temp_path = Path(temp_dir) / "rgb_crop_memmap.npy"
     mm = None
     try:
         mm = np.lib.format.open_memmap(str(temp_path), mode="w+", dtype=np.uint8, shape=(out_h, out_w, 3))
         total_blocks = int(math.ceil(out_h / chunk_size)) * int(math.ceil(out_w / chunk_size))
         done = 0
+        fallback_failed_blocks = 0
+        fallback_recovered_blocks = 0
+        fallback_levels = set()
 
         from PIL import Image
         for oy0 in range(0, out_h, chunk_size):
             oy1 = min(out_h, oy0 + chunk_size)
             for ox0 in range(0, out_w, chunk_size):
+                _raise_if_cancelled(cancel_callback)
+                try:
+                    QApplication.processEvents()
+                except Exception:
+                    pass
                 ox1 = min(out_w, ox0 + chunk_size)
 
                 if ds == 1.0:
@@ -5786,6 +6671,11 @@ def save_rgb_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int, h: 
                     sh = max(1, sy1 - sy0)
 
                 chunk, info = backend.crop(sx0, sy0, sw, sh, fill=255)
+                if isinstance(info, dict) and info.get("used"):
+                    fallback_failed_blocks += int(info.get("failed0") or 0)
+                    fallback_recovered_blocks += int(info.get("recovered") or 0)
+                    if info.get("fallback_level") is not None:
+                        fallback_levels.add(int(info.get("fallback_level")))
                 chunk = _to_uint8_rgb(chunk)
                 target_w = int(ox1 - ox0)
                 target_h = int(oy1 - oy0)
@@ -5803,6 +6693,7 @@ def save_rgb_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int, h: 
                     except Exception:
                         pass
 
+        _raise_if_cancelled(cancel_callback)
         mm.flush()
         compression_kwargs = {"compression": "deflate", "predictor": True} if lossless else {}
         written_levels = 1
@@ -5833,8 +6724,10 @@ def save_rgb_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int, h: 
                 description=f"Generated by {APP_NAME} v{APP_VERSION}; pyramidal TIFF",
                 requested_levels=int(pyramid_levels),
                 low_memory_levels=True,
+                cancel_callback=cancel_callback,
             )
         elif write_ome:
+            _raise_if_cancelled(cancel_callback)
             ome_xml = _build_ome_xml_rgb(
                 size_x=int(out_w),
                 size_y=int(out_h),
@@ -5849,6 +6742,7 @@ def save_rgb_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int, h: 
                 resolution=resolution, resolutionunit=resolutionunit, **compression_kwargs,
             )
         else:
+            _raise_if_cancelled(cancel_callback)
             tifffile.imwrite(
                 str(output_path), mm, bigtiff=True, tile=(256, 256), photometric="rgb",
                 description=_ascii_safe(f"Generated by {APP_NAME} v{APP_VERSION}"),
@@ -5864,22 +6758,35 @@ def save_rgb_crop_lowmem(backend, output_path: Path, x: int, y: int, w: int, h: 
             "chunks": int(total_blocks),
             "temp_bytes": int(out_h) * int(out_w) * 3,
             "pyramid_levels": int(written_levels),
+            "fallback_used": bool(fallback_recovered_blocks > 0),
+            "fallback_failed0": int(fallback_failed_blocks),
+            "fallback_recovered": int(fallback_recovered_blocks),
+            "fallback_levels": sorted(fallback_levels),
         }
     finally:
         try:
-            del mm
+            if mm is not None:
+                try:
+                    mm.flush()
+                except Exception:
+                    pass
+                mmap_obj = getattr(mm, "_mmap", None)
+                if mmap_obj is not None:
+                    try:
+                        mmap_obj.close()
+                    except Exception:
+                        pass
         except Exception:
             pass
+        mm = None
         try:
-            if temp_path.exists():
-                temp_path.unlink()
-            Path(temp_dir).rmdir()
+            shutil.rmtree(str(temp_dir), ignore_errors=True)
         except Exception:
             pass
 
 def save_multichannel_image(output_path, arr, axes=None, write_ome=True, lossless=True,
                             source_resolution=None, source_mpp=None, image_name=None,
-                            pixel_scale=1.0, pyramid_levels: int = 1):
+                            pixel_scale=1.0, pyramid_levels: int = 1, cancel_callback=None):
     """Save scientific crop data without RGB conversion or intensity normalization."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5934,6 +6841,8 @@ def save_multichannel_image(output_path, arr, axes=None, write_ome=True, lossles
 
     photometric = _photometric_for_axes_shape(axes, arr.shape)
 
+    _raise_if_cancelled(cancel_callback)
+
     if int(pyramid_levels or 1) > 1:
         _write_pyramidal_tiff(
             output_path,
@@ -5948,6 +6857,7 @@ def save_multichannel_image(output_path, arr, axes=None, write_ome=True, lossles
             description=f"Generated by {APP_NAME} v{APP_VERSION}; pyramidal TIFF",
             requested_levels=int(pyramid_levels),
             low_memory_levels=bool(arr.nbytes > MAX_PREVIEW_CROP_BYTES),
+            cancel_callback=cancel_callback,
         )
         return
 
@@ -6419,6 +7329,106 @@ def _downsample_bulk_job(cancel_event, progress_cb, message_cb, image_paths, out
         writer.writeheader()
         writer.writerows(rows)
     return {"ok": ok, "failed": failed, "log_path": str(log_path), "task": "downsample"}
+
+
+def _convert_bulk_job(cancel_event, progress_cb, message_cb, image_paths, output_dir,
+                      output_kind, factor, preserve_raw, lossless, overwrite, max_workers=1):
+    paths = [Path(p) for p in image_paths]
+    out_dir = Path(output_dir) if output_dir else None
+    max_workers = max(1, int(max_workers or 1))
+    rows, ok, failed, skipped, jpeg_adjusted = [], 0, 0, 0, 0
+    progress_cb(0, len(paths))
+
+    # JPype/Bio-Formats uses one in-process JVM. Keep VSI batch conversion serial
+    # to avoid competing JVM/BioReader initialization and excessive WSI I/O.
+    if any(_has_ext(p.name, VSI_EXTENSIONS) for p in paths):
+        max_workers = 1
+
+    def run_one(p):
+        _check_cancel(cancel_event)
+        return convert_image_file(
+            p, out_dir, output_kind=output_kind, downsample=factor,
+            preserve_raw=preserve_raw, lossless=lossless, overwrite=overwrite,
+            cancel_callback=lambda: bool(cancel_event and cancel_event.is_set()),
+        )
+
+    def record_result(p, result):
+        nonlocal ok, failed, skipped, jpeg_adjusted
+        status = str(result.get("status", "success"))
+        if status == "success":
+            ok += 1
+        elif status == "skipped":
+            skipped += 1
+        else:
+            failed += 1
+        if result.get("jpeg_auto_adjusted"):
+            jpeg_adjusted += 1
+        rows.append({
+            "input": str(p),
+            "output": result.get("output", ""),
+            "status": status,
+            "reader": result.get("reader", ""),
+            "requested_downsample": result.get("requested_ds", factor),
+            "effective_downsample": result.get("effective_ds", factor),
+            "jpeg_auto_adjusted": bool(result.get("jpeg_auto_adjusted", False)),
+            "preservation": result.get("preservation", ""),
+            "message": result.get("message", ""),
+        })
+
+    if max_workers <= 1 or len(paths) <= 1:
+        for i, p in enumerate(paths, start=1):
+            _check_cancel(cancel_event)
+            try:
+                message_cb(f"Converting {p.name} ({i}/{len(paths)})")
+                result = run_one(p)
+                record_result(p, result)
+            except Exception as exc:
+                failed += 1
+                rows.append({
+                    "input": str(p), "output": "", "status": "failed", "reader": "",
+                    "requested_downsample": factor, "effective_downsample": "",
+                    "jpeg_auto_adjusted": False, "preservation": "",
+                    "message": f"{exc}\n{traceback.format_exc()}",
+                })
+            progress_cb(i, len(paths))
+    else:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(paths))) as ex:
+            future_to_path = {ex.submit(run_one, p): p for p in paths}
+            done = 0
+            for fut in as_completed(future_to_path):
+                _check_cancel(cancel_event)
+                p = future_to_path[fut]
+                done += 1
+                try:
+                    result = fut.result()
+                    record_result(p, result)
+                    message_cb(f"Finished conversion: {p.name} ({done}/{len(paths)})")
+                except Exception as exc:
+                    failed += 1
+                    rows.append({
+                        "input": str(p), "output": "", "status": "failed", "reader": "",
+                        "requested_downsample": factor, "effective_downsample": "",
+                        "jpeg_auto_adjusted": False, "preservation": "",
+                        "message": f"{exc}\n{traceback.format_exc()}",
+                    })
+                progress_cb(done, len(paths))
+
+    log_dir = out_dir or (paths[0].parent if paths else Path.cwd())
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"PathoImageToolkit_conversion_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    fieldnames = [
+        "input", "output", "status", "reader", "requested_downsample",
+        "effective_downsample", "jpeg_auto_adjusted", "preservation", "message"
+    ]
+    with open(log_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+    return {
+        "ok": ok, "failed": failed, "skipped": skipped,
+        "jpeg_adjusted": jpeg_adjusted, "log_path": str(log_path), "task": "convert"
+    }
 
 
 def _export_lif_file_headless(lif_path, scene_indices, options, cancel_event=None, progress_cb=None, message_cb=None):
@@ -9686,8 +10696,14 @@ class WSICropTileMergeGUI(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        # Create a managed temp session. Abandoned sessions from crashed runs are
+        # removed automatically before this new session is created.
+        self._temp_session_dir = _ensure_temp_session()
+        self._crop_cancel_requested = False
+        self._crop_operation_active = False
+        self._close_after_crop_cancel = False
         self.setWindowIcon(QIcon(resource_path(APP_ICON_PATH)))
-        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} - WSI Crop / Preview / Tile / Merge")
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} - WSI Crop / Convert / Preview / Tile / Merge")
         self.setGeometry(40, 40, 980, 640)
         self.setMinimumSize(600, 420)
         self.setStyleSheet("background-color: #f0f0f0;")
@@ -9703,6 +10719,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.downsample_paths = []
         self.downsample_preview_path = None
         self.downsample_roi = None
+        self.convert_paths = []
         self.preview_path = None
         self.preview_backend = None  # cached reader for fast repeated Image Preview region reads
         self.preview_linked_images = []  # additional registered/colocalized images for synchronized tile popup
@@ -9766,7 +10783,7 @@ class WSICropTileMergeGUI(QMainWindow):
         root.setContentsMargins(4, 4, 4, 4)
         root.setSpacing(4)
 
-        title = QLabel(f"{APP_NAME} v{APP_VERSION} - WSI Crop / Preview / Tile / Merge")
+        title = QLabel(f"{APP_NAME} v{APP_VERSION} - WSI Crop / Convert / Preview / Tile / Merge")
         title.setFont(QFont("Arial", 12, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("color: #2c3e50; margin: 2px;")
@@ -9776,7 +10793,7 @@ class WSICropTileMergeGUI(QMainWindow):
         self.mode_combo = QComboBox()
         self.mode_combo.addItems([
             "Crop", "Tiles", "Merge Tiles", "Split LIF",
-            "Downsample", "Image Preview", "IF Threshold Explorer", "Explorer"
+            "Downsample", "Convert", "Image Preview", "IF Threshold Explorer", "Explorer"
         ])
         self.mode_combo.setMaximumWidth(180)
 
@@ -9820,12 +10837,21 @@ class WSICropTileMergeGUI(QMainWindow):
         self.stack.addWidget(self._build_merge_page())
         self.stack.addWidget(self._build_lif_page())
         self.stack.addWidget(self._build_downsample_page())
+        self.stack.addWidget(self._build_convert_page())
         self.stack.addWidget(self._build_preview_page())
         self.stack.addWidget(self._build_if_threshold_page())
         self.stack.addWidget(self._build_explorer_page())
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
 
         root.addWidget(self.info_label)
+        try:
+            cleaned_count = len((_LAST_STALE_CLEANUP_RESULT or {}).get("removed", []))
+            if cleaned_count:
+                self.info_label.setText(
+                    f"Cleaned {cleaned_count} abandoned temporary item(s) from a previous session."
+                )
+        except Exception:
+            pass
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         root.addWidget(self.progress)
@@ -10057,6 +11083,7 @@ class WSICropTileMergeGUI(QMainWindow):
             <li>OME-TIFF export with physical pixel size preservation when available.</li>
             <li>Leica LIF splitting into one OME-TIFF per internal scene/page, preserving IF channels.</li>
             <li>Bulk downsampling with raw multichannel OME-TIFF preservation when possible.</li>
+            <li>Batch format conversion with optional downsampling and automatic JPEG-safe downsample.</li>
             <li>Interactive image preview with channel on/off checkboxes, color assignment, region-based zoom, and JPG capture.</li>
             <li>BigTIFF output and optional lossless DEFLATE compression.</li>
           </ul>
@@ -10313,6 +11340,179 @@ class WSICropTileMergeGUI(QMainWindow):
             f"Done. Success: {result.get('ok', 0)}. Failed: {result.get('failed', 0)}.\n\nLog:\n{result.get('log_path', '')}",
         )
         self.info_label.setText(f"Downsample complete. Log: {result.get('log_path', '')}")
+
+
+    # ========================================================
+    # Batch format converter page
+    # ========================================================
+
+    def _build_convert_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        file_box = QGroupBox("Input images")
+        file_layout = QVBoxLayout(file_box)
+        row = QHBoxLayout()
+        files_btn = QPushButton("Select files")
+        files_btn.clicked.connect(self.load_convert_files)
+        folder_btn = QPushButton("Select folder")
+        folder_btn.clicked.connect(self.load_convert_folder)
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(self.clear_convert_files)
+        self.convert_file_label = QLabel("No images selected")
+        self.convert_file_label.setStyleSheet("padding: 10px; border: 1px solid #bdc3c7; border-radius: 5px;")
+        row.addWidget(files_btn)
+        row.addWidget(folder_btn)
+        row.addWidget(clear_btn)
+        row.addWidget(self.convert_file_label, 1)
+        file_layout.addLayout(row)
+
+        out_row = QHBoxLayout()
+        out_btn = QPushButton("Output folder")
+        out_btn.clicked.connect(self.browse_convert_output_folder)
+        self.convert_output_edit = QLineEdit("")
+        self.convert_output_edit.setPlaceholderText("Leave empty to save beside each input file")
+        out_row.addWidget(out_btn)
+        out_row.addWidget(self.convert_output_edit, 1)
+        file_layout.addLayout(out_row)
+        layout.addWidget(file_box)
+
+        opt = QGroupBox("Conversion options")
+        grid = QGridLayout(opt)
+        self.convert_output_combo = QComboBox()
+        self.convert_output_combo.addItems([
+            "OME-TIFF (.ome.tif)", "TIFF (.tif)", "JPEG (.jpg)", "PNG (.png)"
+        ])
+        self.convert_output_combo.currentIndexChanged.connect(self._update_convert_options)
+
+        self.convert_downsample_chk = QCheckBox("Apply downsample")
+        self.convert_downsample_chk.setChecked(False)
+        self.convert_downsample_chk.toggled.connect(self._update_convert_options)
+        self.convert_downsample_spin = QDoubleSpinBox()
+        self.convert_downsample_spin.setRange(1.0, 256.0)
+        self.convert_downsample_spin.setDecimals(2)
+        self.convert_downsample_spin.setSingleStep(0.1)
+        self.convert_downsample_spin.setValue(1.0)
+
+        self.convert_preserve_chk = QCheckBox("Preserve raw channels for TIFF/OME-TIFF when possible")
+        self.convert_preserve_chk.setChecked(False)
+        self.convert_preserve_chk.setToolTip(
+            "For scientific TIFF/QPTIFF data this preserves original dtype/channels when a safe raw path is available. "
+            "For very large VSI stacks, raw conversion may require substantial memory; leave unchecked for H&E/RGB conversion."
+        )
+        self.convert_lossless_chk = QCheckBox("Lossless TIFF compression")
+        self.convert_lossless_chk.setChecked(True)
+        self.convert_overwrite_chk = QCheckBox("Overwrite existing outputs")
+        self.convert_overwrite_chk.setChecked(False)
+
+        grid.addWidget(QLabel("Output format:"), 0, 0)
+        grid.addWidget(self.convert_output_combo, 0, 1)
+        grid.addWidget(self.convert_downsample_chk, 0, 2)
+        grid.addWidget(self.convert_downsample_spin, 0, 3)
+        grid.addWidget(self.convert_preserve_chk, 1, 0, 1, 2)
+        grid.addWidget(self.convert_lossless_chk, 1, 2)
+        grid.addWidget(self.convert_overwrite_chk, 1, 3)
+        layout.addWidget(opt)
+
+        self.convert_note_label = QLabel()
+        self.convert_note_label.setWordWrap(True)
+        self.convert_note_label.setStyleSheet(
+            "color: #4b5563; background: #f7f9fb; border: 1px solid #d7dde3; "
+            "border-radius: 4px; padding: 8px;"
+        )
+        layout.addWidget(self.convert_note_label)
+
+        run_btn = QPushButton("RUN BATCH CONVERSION")
+        run_btn.clicked.connect(self.run_convert_bulk)
+        layout.addWidget(run_btn)
+        layout.addStretch(1)
+        self._update_convert_options()
+        return page
+
+    def _update_convert_options(self, *args):
+        if not hasattr(self, "convert_output_combo"):
+            return
+        output_format = _conversion_output_spec(self.convert_output_combo.currentText())[1]
+        is_tiff = output_format == "tiff"
+        self.convert_preserve_chk.setEnabled(is_tiff)
+        self.convert_lossless_chk.setEnabled(is_tiff)
+        self.convert_downsample_spin.setEnabled(self.convert_downsample_chk.isChecked())
+        if output_format == "jpeg":
+            self.convert_note_label.setText(
+                f"JPEG safety: if the selected downsample would produce an axis larger than "
+                f"{JPEG_SAFE_MAX_DIMENSION:,} px, PathoImage Toolkit automatically raises the downsample "
+                "for that file to the minimum JPEG-safe value. The effective value is written to the CSV log."
+            )
+        elif is_tiff:
+            self.convert_note_label.setText(
+                "TIFF/OME-TIFF conversion can use a memory-light RGB path. Enable raw-channel preservation only "
+                "when scientific channel values/dtype must be retained."
+            )
+        else:
+            self.convert_note_label.setText(
+                "PNG conversion writes the visual RGB representation. Optional downsample is applied before saving."
+            )
+
+    def load_convert_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Select images to convert", "", _image_file_filter())
+        if not paths:
+            return
+        self.convert_paths = [Path(p) for p in paths]
+        self.convert_file_label.setText(f"Selected {len(self.convert_paths)} file(s)")
+        self.info_label.setText("Batch conversion files selected.")
+
+    def load_convert_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select folder with images to convert")
+        if not folder:
+            return
+        folder = Path(folder)
+        self.convert_paths = sorted(
+            p for p in folder.iterdir() if p.is_file() and _has_ext(p.name, SUPPORTED_EXTENSIONS)
+        )
+        self.convert_file_label.setText(f"Folder: {len(self.convert_paths)} supported file(s)")
+        self.info_label.setText("Batch conversion folder loaded.")
+
+    def clear_convert_files(self):
+        self.convert_paths = []
+        if hasattr(self, "convert_file_label"):
+            self.convert_file_label.setText("No images selected")
+        self.info_label.setText("Conversion selection cleared.")
+
+    def browse_convert_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select output folder for converted images")
+        if folder:
+            self.convert_output_edit.setText(folder)
+
+    def run_convert_bulk(self):
+        if not self.convert_paths:
+            QMessageBox.warning(self, "No images", "Select one or more images first.")
+            return
+        out_dir = self.convert_output_edit.text().strip()
+        output_kind = self.convert_output_combo.currentText()
+        factor = float(self.convert_downsample_spin.value()) if self.convert_downsample_chk.isChecked() else 1.0
+        preserve_raw = self.convert_preserve_chk.isChecked() and _conversion_output_spec(output_kind)[1] == "tiff"
+        lossless = self.convert_lossless_chk.isChecked()
+        overwrite = self.convert_overwrite_chk.isChecked()
+        workers = self._worker_count()
+        if any(_has_ext(p.name, VSI_EXTENSIONS) for p in self.convert_paths):
+            workers = 1
+            self.info_label.setText("VSI detected: conversion will use one worker for Bio-Formats/JVM safety.")
+        self._start_background_job(
+            "Batch conversion", _convert_bulk_job, self._on_convert_done,
+            [str(p) for p in self.convert_paths], out_dir, output_kind,
+            factor, preserve_raw, lossless, overwrite, workers,
+        )
+
+    def _on_convert_done(self, result):
+        QMessageBox.information(
+            self,
+            "Conversion complete",
+            f"Done. Success: {result.get('ok', 0)}. Skipped: {result.get('skipped', 0)}. "
+            f"Failed: {result.get('failed', 0)}.\n"
+            f"JPEG auto-downsample adjusted: {result.get('jpeg_adjusted', 0)} file(s).\n\n"
+            f"Log:\n{result.get('log_path', '')}",
+        )
+        self.info_label.setText(f"Conversion complete. Log: {result.get('log_path', '')}")
 
     # ========================================================
     # Image Preview page
@@ -11980,6 +13180,17 @@ class WSICropTileMergeGUI(QMainWindow):
 
 
     def closeEvent(self, event):
+        # If a chunked crop is active, request a clean cancellation first. This
+        # allows its finally blocks to close memmaps and delete partial output.
+        if getattr(self, "_crop_operation_active", False):
+            self._close_after_crop_cancel = True
+            self._crop_cancel_requested = True
+            if hasattr(self, "crop_cancel_btn"):
+                self.crop_cancel_btn.setEnabled(False)
+                self.crop_cancel_btn.setText("Cancelling...")
+            self.info_label.setText("Cancelling active crop before closing...")
+            event.ignore()
+            return
         try:
             if getattr(self, "preview_backend", None) is not None:
                 self.preview_backend.close()
@@ -11997,6 +13208,10 @@ class WSICropTileMergeGUI(QMainWindow):
         try:
             if getattr(self, "if_backend", None) is not None:
                 self.if_backend.close()
+        except Exception:
+            pass
+        try:
+            _cleanup_current_temp_session()
         except Exception:
             pass
         super().closeEvent(event)
@@ -12563,7 +13778,7 @@ class WSICropTileMergeGUI(QMainWindow):
         out_layout.addWidget(self.crop_suffix_edit)
         out_layout.addWidget(QLabel("Downsample:"))
         self.crop_downsample_spin = QDoubleSpinBox()
-        self.crop_downsample_spin.setRange(0.01, 1000.0)
+        self.crop_downsample_spin.setRange(1.0, 1000.0)
         self.crop_downsample_spin.setDecimals(2)
         self.crop_downsample_spin.setValue(1.0)
         self.crop_downsample_spin.setMaximumWidth(100)
@@ -12581,7 +13796,9 @@ class WSICropTileMergeGUI(QMainWindow):
         self.crop_pyramid_chk.setChecked(True)
         self.crop_pyramid_chk.setToolTip(
             "Write the crop as a tiled pyramid with 8 total resolution levels "
-            "(or fewer only if the crop reaches 1 × 1 pixels first). TIFF/OME-TIFF only."
+            "(or fewer only if the crop reaches 1 × 1 pixels first). TIFF/OME-TIFF only. "
+            "The full-resolution level is preserved; the extra pyramid levels add about 33% "
+            "more pixels before compression, so a lossless crop can be larger than the source WSI."
         )
         self.crop_preview_chk = QCheckBox("Preview panel")
         self.crop_preview_chk.setChecked(True)
@@ -12648,10 +13865,18 @@ class WSICropTileMergeGUI(QMainWindow):
         btn_row = QHBoxLayout()
         preview_btn = QPushButton("Preview Crop")
         preview_btn.clicked.connect(self.preview_crop)
-        crop_btn = QPushButton("CROP & SAVE")
-        crop_btn.clicked.connect(self.crop_image)
+        self.crop_save_btn = QPushButton("CROP & SAVE")
+        self.crop_save_btn.clicked.connect(self.crop_image)
+        self.crop_cancel_btn = QPushButton("Cancel crop")
+        self.crop_cancel_btn.setEnabled(False)
+        self.crop_cancel_btn.setToolTip(
+            "Request cancellation of the active crop. Chunked TIFF/OME-TIFF operations "
+            "stop at the next safe checkpoint and remove partial temporary/output files."
+        )
+        self.crop_cancel_btn.clicked.connect(self.cancel_crop_operation)
         btn_row.addWidget(preview_btn)
-        btn_row.addWidget(crop_btn)
+        btn_row.addWidget(self.crop_save_btn)
+        btn_row.addWidget(self.crop_cancel_btn)
         layout.addLayout(btn_row)
 
         return page
@@ -12897,7 +14122,7 @@ class WSICropTileMergeGUI(QMainWindow):
 
     def _crop_output_settings(self):
         suffix = self.crop_suffix_edit.text().strip() or "final"
-        downsample = float(self.crop_downsample_spin.value())
+        downsample = max(1.0, float(self.crop_downsample_spin.value()))
         if downsample != 1.0:
             ds_txt = f"DS{int(downsample)}" if downsample.is_integer() else f"DS{downsample:g}"
             suffix = f"{suffix}{ds_txt}"
@@ -12907,14 +14132,201 @@ class WSICropTileMergeGUI(QMainWindow):
         ext = ".ome.tif" if write_ome else _extension_from_combo(combo)
         return suffix, downsample, combo, output_format, write_ome, ext
 
+    def cancel_crop_operation(self):
+        """Request cancellation of the current crop at the next safe checkpoint."""
+        if not getattr(self, "_crop_operation_active", False):
+            return
+        self._crop_cancel_requested = True
+        if hasattr(self, "crop_cancel_btn"):
+            self.crop_cancel_btn.setEnabled(False)
+            self.crop_cancel_btn.setText("Cancelling...")
+        self.info_label.setText("Cancelling crop... temporary and partial output files will be removed.")
+        QApplication.processEvents()
+
+    def _crop_cancel_check(self) -> bool:
+        return bool(getattr(self, "_crop_cancel_requested", False))
+
+    def _set_crop_operation_active(self, active: bool):
+        self._crop_operation_active = bool(active)
+        if active:
+            self._crop_cancel_requested = False
+        if hasattr(self, "crop_save_btn"):
+            self.crop_save_btn.setEnabled(not active)
+        if hasattr(self, "crop_cancel_btn"):
+            self.crop_cancel_btn.setEnabled(active)
+            self.crop_cancel_btn.setText("Cancel crop")
+        try:
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+    def _jpeg_preflight_downsample(self, width: int, height: int, current_ds: float) -> Optional[float]:
+        """Require JPEG-compatible dimensions before any expensive crop read.
+
+        This is a real encoder/format constraint, not the optional RAM warning.
+        The Toolkit therefore does not offer "Continue anyway" when either output
+        axis exceeds the conservative libjpeg limit.
+        """
+        ds = max(1.0, float(current_ds or 1.0))
+        suggested = _jpeg_required_downsample(width, height)
+        while True:
+            out_w = max(1, int(round(float(width) / ds)))
+            out_h = max(1, int(round(float(height) / ds)))
+            if out_w <= JPEG_SAFE_MAX_DIMENSION and out_h <= JPEG_SAFE_MAX_DIMENSION:
+                return ds
+
+            suggested_w = max(1, int(round(float(width) / suggested)))
+            suggested_h = max(1, int(round(float(height) / suggested)))
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("JPEG cannot be saved at this resolution")
+            box.setText(
+                "This crop is too large to be stored as one JPEG at the selected Downsample."
+            )
+            box.setInformativeText(
+                f"Requested crop: {int(width):,} × {int(height):,} px\n"
+                f"Current Downsample: {ds:g}\n"
+                f"Current JPEG size: {out_w:,} × {out_h:,} px\n"
+                f"Maximum supported JPEG dimension: {JPEG_SAFE_MAX_DIMENSION:,} px per axis\n\n"
+                f"Minimum suggested Downsample: {suggested:g}\n"
+                f"Size with DS {suggested:g}: {suggested_w:,} × {suggested_h:,} px\n\n"
+                "Full-resolution (DS 1) can still be preserved by saving as TIFF/OME-TIFF, "
+                "or by using JPEG Tiles mode instead of one single JPEG."
+            )
+            use_suggested = box.addButton(f"Use DS {suggested:g}", QMessageBox.AcceptRole)
+            use_specific = box.addButton("Set specific DS...", QMessageBox.ActionRole)
+            cancel_btn = box.addButton(QMessageBox.Cancel)
+            box.setDefaultButton(use_suggested)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked is use_suggested:
+                return float(suggested)
+            if clicked is use_specific:
+                value, ok = QInputDialog.getDouble(
+                    self,
+                    "JPEG Downsample",
+                    f"Enter Downsample (minimum required: {suggested:g}):",
+                    max(ds, suggested),
+                    1.0,
+                    1000.0,
+                    2,
+                )
+                if not ok:
+                    return None
+                ds = max(1.0, float(value))
+                # Loop again: a manually entered value below the minimum is not
+                # accepted silently; the same clear warning is shown again.
+                continue
+            if clicked is cancel_btn:
+                return None
+            return None
+
+    def _confirm_large_memory_crop(self, estimated_bytes: int, output_format: str) -> bool:
+        if estimated_bytes <= MAX_INTERACTIVE_CROP_BYTES:
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Large memory operation")
+        fmt = "JPEG" if str(output_format).lower() == "jpeg" else str(output_format).upper()
+        box.setText(
+            f"This {fmt} crop is estimated to require {_human_bytes(estimated_bytes)} "
+            "for the final RGB array alone."
+        )
+        box.setInformativeText(
+            "Peak RAM use can be higher while reading, resizing and encoding. "
+            "The previous 2.5 GiB limit is now a warning rather than a hard stop.\n\n"
+            "Continue only if the computer has enough available memory."
+        )
+        continue_btn = box.addButton("Continue", QMessageBox.AcceptRole)
+        cancel_btn = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(cancel_btn)
+        box.exec_()
+        return box.clickedButton() is continue_btn
+
+    def _crop_output_size_note(self, out_path: Path, pyramid_levels: int, lossless: bool) -> str:
+        """Explain when a crop TIFF/OME-TIFF is larger than its source file."""
+        try:
+            source_path = Path(self.backend.path)
+            out_path = Path(out_path)
+            if not source_path.exists() or not out_path.exists():
+                return ""
+            source_size = int(source_path.stat().st_size)
+            output_size = int(out_path.stat().st_size)
+            if source_size <= 0 or output_size <= source_size:
+                return ""
+            reasons = []
+            if lossless:
+                reasons.append("lossless DEFLATE may be less compact than the source WSI/NDPI compression")
+            if int(pyramid_levels or 1) > 1:
+                mult = _pyramid_pixel_multiplier(int(pyramid_levels))
+                reasons.append(
+                    f"the {int(pyramid_levels)}-level pyramid stores ~{(mult - 1.0) * 100:.1f}% additional downsampled pixels"
+                )
+            if not reasons:
+                reasons.append("the output encoding/compression differs from the source")
+            return (
+                f"\n\nFile-size note: output {_human_bytes(output_size)} is larger than source "
+                f"{_human_bytes(source_size)}. This does not mean level-0 resolution was increased; "
+                + "; ".join(reasons)
+                + "."
+            )
+        except Exception:
+            return ""
+
+    def _show_level0_recovery_warning(self, meta: Optional[Dict[str, Any]]):
+        if not isinstance(meta, dict):
+            return
+        used = bool(meta.get("used") or meta.get("fallback_used"))
+        recovered = int(meta.get("recovered") or meta.get("fallback_recovered") or 0)
+        if not used and recovered <= 0:
+            return
+        failed = int(meta.get("failed0") or meta.get("fallback_failed0") or recovered)
+        levels = meta.get("fallback_levels")
+        if levels is None:
+            level = meta.get("fallback_level")
+            levels = [] if level is None else [level]
+        try:
+            levels_text = ", ".join(str(int(v)) for v in levels) if levels else "a lower pyramid level"
+        except Exception:
+            levels_text = str(levels or "a lower pyramid level")
+        QMessageBox.warning(
+            self,
+            "Level-0 recovery used",
+            "The crop completed successfully, but one or more level-0 blocks could not be read.\n\n"
+            f"Level-0 read failures: {failed}\n"
+            f"Recovered blocks: {recovered}\n"
+            f"Fallback level(s): {levels_text}\n\n"
+            "Only the failed regions were recovered from a lower-resolution pyramid level and resized. "
+            "Those recovered regions therefore do not contain the exact original level-0 pixel values."
+        )
+
     def crop_image(self):
         if not self.backend.path or not self.backend.path_obj:
             QMessageBox.warning(self, "Error", "Please select a file first.")
             return
+        if getattr(self, "_crop_operation_active", False):
+            QMessageBox.warning(self, "Crop already running", "Cancel or wait for the current crop operation to finish.")
+            return
+
+        out_path = None
+        fallback_meta = None
+        self._crop_cancel_requested = False
         try:
             suffix, raw_downsample, combo, output_format, write_ome, ext = self._crop_output_settings()
-            out_path = self.backend.path_obj.parent / f"{self.backend.path_obj.stem}_crop_{suffix}{ext}"
             x, y, w, h = self.x_spin.value(), self.y_spin.value(), self.w_spin.value(), self.h_spin.value()
+
+            # JPEG format limits are independent from RAM limits. Never silently
+            # change Downsample: suggest the minimum and let the user choose.
+            if output_format == "jpeg":
+                selected_ds = self._jpeg_preflight_downsample(w, h, raw_downsample)
+                if selected_ds is None:
+                    self.info_label.setText("JPEG crop cancelled before saving.")
+                    return
+                if abs(float(selected_ds) - float(raw_downsample)) > 1e-9:
+                    self.crop_downsample_spin.setValue(float(selected_ds))
+                    suffix, raw_downsample, combo, output_format, write_ome, ext = self._crop_output_settings()
+
+            out_path = self.backend.path_obj.parent / f"{self.backend.path_obj.stem}_crop_{suffix}{ext}"
             pyramid_levels = (
                 PYRAMID_TOTAL_LEVELS
                 if output_format == "tiff" and hasattr(self, "crop_pyramid_chk") and self.crop_pyramid_chk.isChecked()
@@ -12926,123 +14338,132 @@ class WSICropTileMergeGUI(QMainWindow):
             preserve_raw = (
                 hasattr(self, "crop_preserve_channels_chk")
                 and self.crop_preserve_channels_chk.isChecked()
-                and self.backend.reader == "tifffile"
+                and self.backend.reader in ("tifffile", "bioformats")
                 and output_format != "jpeg"
             )
 
-            # RGB/RGBA pyramidal TIFFs often have a Samples axis (YXS or TZYXS).
-            # They are visual images, not raw IF channel stacks. Treat these as
-            # visual RGB crops even if the Preserve raw checkbox is enabled; this
-            # prevents tifffile OME writing errors such as "shape does not match
-            # stored shape" and allows OpenSlide/pyramid fallbacks for cropping.
+            # A uint8 RGB/RGBA Samples-axis TIFF can safely use the visual RGB path:
+            # _to_uint8_rgb is identity for uint8 values. Higher-bit-depth/float RGB
+            # must remain raw so native dtype and intensities are not normalized.
             if preserve_raw:
-                _est_bytes0, _est_shape0, _est_axes0, _est_dtype0 = _estimate_tiff_raw_crop_bytes(
+                _est_bytes0, _est_shape0, _est_axes0, _est_dtype0 = _estimate_backend_raw_crop_bytes(
                     self.backend, x, y, w, h, downsample=raw_downsample
                 )
                 if _est_shape0 is not None and _est_axes0 and _is_sample_axis_array(_est_shape0, _est_axes0):
-                    preserve_raw = False
-                    self.info_label.setText(
-                        f"Source uses RGB/RGBA Samples axis ({_est_axes0}); saving as visual RGB crop instead of raw IF planes."
-                    )
-                    QApplication.processEvents()
-
-            # Preflight memory guard.  This prevents NumPy from attempting to
-            # allocate tens of GiB for very large crops such as whole-slide RGB
-            # regions.  The preview path remains available because it uses a
-            # reduced pyramid/overview region.
-            if preserve_raw:
-                est_bytes, est_shape, est_axes, est_dtype = _estimate_tiff_raw_crop_bytes(
-                    self.backend, x, y, w, h, downsample=raw_downsample
-                )
-                # If the source has a Samples axis (YXS/TZYXS), it is an RGB/RGBA
-                # image rather than scientific IF channel data. Saving this as
-                # minisblack OME causes tifffile's "shape does not match stored shape".
-                # Keep the crop in the normal in-memory path if small enough;
-                # save_multichannel_image will write it with photometric=rgb.
-                if est_shape is not None and est_axes and _is_sample_axis_array(est_shape, est_axes):
-                    if est_bytes is not None and est_bytes > MAX_INTERACTIVE_CROP_BYTES:
-                        QMessageBox.warning(
-                            self,
-                            "RGB/Sample-axis crop too large",
-                            "This source is stored with a Samples axis (for example YXS/TZYXS). "
-                            "It cannot be streamed safely as raw IF planes.\n\n"
-                            f"Estimated output: {_human_bytes(est_bytes)}\n"
-                            f"Shape: {est_shape}\nAxes: {est_axes}\n\n"
-                            "Use a downsampled visual crop, reduce the ROI, or use Tiles mode."
-                        )
-                        return
-                if est_bytes is not None and est_bytes > MAX_INTERACTIVE_CROP_BYTES:
-                    if raw_downsample == 1.0 and est_axes and "S" not in est_axes:
-                        if pyramid_levels > 1:
-                            QMessageBox.warning(
-                                self,
-                                "Raw pyramid too large",
-                                "This raw multichannel crop is larger than the safe in-memory limit and "
-                                "cannot currently be streamed into an 8-level scientific-data pyramid.\n\n"
-                                f"Estimated output: {_human_bytes(est_bytes)}\n"
-                                f"Shape: {est_shape}\nAxes: {est_axes}\n\n"
-                                "Reduce the crop, increase Downsample, or uncheck Preserve raw multichannel data "
-                                "to save a low-memory RGB pyramid."
-                            )
-                            return
+                    try:
+                        sample_dtype = np.dtype(_est_dtype0)
+                    except Exception:
+                        sample_dtype = None
+                    if sample_dtype == np.dtype(np.uint8):
+                        preserve_raw = False
                         self.info_label.setText(
-                            f"Large raw crop detected ({_human_bytes(est_bytes)}). Saving with low-memory streaming..."
+                            f"Source uses uint8 RGB/RGBA Samples axis ({_est_axes0}); "
+                            "saving through the RGB path without intensity normalization."
                         )
                         QApplication.processEvents()
-                        result = save_tiff_raw_crop_lowmem(
-                            self.backend, out_path, x, y, w, h,
-                            write_ome=write_ome, lossless=self.crop_lossless_chk.isChecked(),
-                            image_name=out_path.stem,
+                    else:
+                        self.info_label.setText(
+                            f"Source uses native {sample_dtype} RGB/RGBA Samples data ({_est_axes0}); "
+                            "preserving original dtype/intensities in TIFF/OME-TIFF."
                         )
-                        # Show only a reduced preview after saving.
-                        try:
-                            arr, axes, meta = read_roi_region_from_backend(self.backend, (x, y, w, h), max_side=1000)
-                            preview_rgb = _array_to_rgb_preview(arr, axes)
-                            if self.crop_preview_chk.isChecked():
-                                self._set_label_pixmap(self.crop_thumb_out, _downsample_for_preview(preview_rgb, 512))
-                        except Exception:
-                            pass
-                        cal_text = f" | MPP inherited: {_format_mpp_text(self.backend.source_mpp)}" if self.backend.source_mpp else " | WARNING: source MPP unknown; output viewer may default to 1 µm/px"
-                        saved_text = (
-                            f"Saved large raw crop using low-memory streaming: {out_path} | "
-                            f"shape={result.get('shape')} | axes={result.get('axes')} | dtype={result.get('dtype')}{cal_text}"
-                        )
-                        self.info_label.setText(saved_text)
-                        QMessageBox.information(self, "Success", saved_text)
-                        return
-                    QMessageBox.warning(
-                        self,
-                        "Crop too large for memory",
-                        "This raw crop is too large for the current in-memory/downsample path.\n\n"
-                        f"Estimated output: {_human_bytes(est_bytes)}\n"
-                        f"Shape: {est_shape}\nAxes: {est_axes}\n\n"
-                        "Use downsampled tiles, reduce the ROI, or save an undownsampled non-RGB raw crop when possible."
-                    )
-                    return
-            else:
-                visual_est_rgb = _estimate_rgb_crop_bytes(w, h, downsample=raw_downsample, channels=3, dtype=np.uint8)
-                if visual_est_rgb > MAX_INTERACTIVE_CROP_BYTES:
-                    if output_format == "jpeg":
-                        QMessageBox.warning(
-                            self,
-                            "JPEG crop too large",
-                            "This crop is too large to build as a single JPEG array.\n\n"
-                            f"Estimated RGB output: {_human_bytes(visual_est_rgb)}\n"
-                            f"ROI: X={x}, Y={y}, W={w}, H={h}\n\n"
-                            "Please save as TIFF/OME-TIFF for low-memory chunked export, "
-                            "increase Downsample, or use Tiles mode."
-                        )
-                        return
-                    visual_lowmem = True
+                        QApplication.processEvents()
+
+            # Determine which operations can stay low-memory and which require an
+            # in-memory array. The former 2.5 GiB stop is now a warning whenever
+            # the user can reasonably choose to continue.
+            if preserve_raw:
+                est_bytes, est_shape, est_axes, est_dtype = _estimate_backend_raw_crop_bytes(
+                    self.backend, x, y, w, h, downsample=raw_downsample
+                )
+                sample_axis = bool(est_shape is not None and est_axes and _is_sample_axis_array(est_shape, est_axes))
+                can_stream_raw = (
+                    self.backend.reader == "tifffile"
+                    and est_bytes is not None
+                    and est_bytes > MAX_INTERACTIVE_CROP_BYTES
+                    and raw_downsample == 1.0
+                    and est_axes
+                    and "S" not in est_axes
+                    and pyramid_levels <= 1
+                )
+
+                if can_stream_raw:
+                    self._set_crop_operation_active(True)
                     self.info_label.setText(
-                        f"Large RGB crop detected ({_human_bytes(visual_est_rgb)}). Saving with low-memory tiled export..."
+                        f"Large raw crop detected ({_human_bytes(est_bytes)}). Saving with low-memory streaming..."
                     )
                     QApplication.processEvents()
 
+                    def raw_progress(done, total):
+                        self.info_label.setText(f"Saving raw crop: {done}/{total} plane(s)")
+                        self.progress.setVisible(True)
+                        self.progress.setRange(0, max(1, int(total)))
+                        self.progress.setValue(int(done))
+                        QApplication.processEvents()
+
+                    result = save_tiff_raw_crop_lowmem(
+                        self.backend, out_path, x, y, w, h,
+                        write_ome=write_ome,
+                        lossless=self.crop_lossless_chk.isChecked(),
+                        image_name=out_path.stem,
+                        progress_callback=raw_progress,
+                        cancel_callback=self._crop_cancel_check,
+                    )
+                    _raise_if_cancelled(self._crop_cancel_check)
+                    try:
+                        arr, axes, meta = read_roi_region_from_backend(self.backend, (x, y, w, h), max_side=1000)
+                        preview_rgb = _array_to_rgb_preview(arr, axes)
+                        if self.crop_preview_chk.isChecked():
+                            self._set_label_pixmap(self.crop_thumb_out, _downsample_for_preview(preview_rgb, 512))
+                    except Exception:
+                        pass
+                    cal_text = f" | MPP inherited: {_format_mpp_text(self.backend.source_mpp)}" if self.backend.source_mpp else " | WARNING: source MPP unknown; output viewer may default to 1 µm/px"
+                    saved_text = (
+                        f"Saved large raw crop using low-memory streaming: {out_path} | "
+                        f"shape={result.get('shape')} | axes={result.get('axes')} | dtype={result.get('dtype')}{cal_text}"
+                    )
+                    if output_format == "tiff":
+                        saved_text += self._crop_output_size_note(out_path, 1, self.crop_lossless_chk.isChecked())
+                    self.info_label.setText(saved_text)
+                    QMessageBox.information(self, "Success", saved_text)
+                    return
+
+                if est_bytes is not None and est_bytes > MAX_INTERACTIVE_CROP_BYTES:
+                    # For Samples-axis raw data, downsampled raw data, or a raw
+                    # pyramid, current code must materialize the crop in RAM.
+                    if not self._confirm_large_memory_crop(est_bytes, "raw TIFF/OME-TIFF"):
+                        self.info_label.setText("Crop cancelled before allocating the large raw array.")
+                        return
+
+            else:
+                visual_est_rgb = _estimate_rgb_crop_bytes(
+                    w, h, downsample=raw_downsample, channels=3, dtype=np.uint8
+                )
+                if output_format == "jpeg":
+                    if visual_est_rgb > MAX_INTERACTIVE_CROP_BYTES:
+                        if not self._confirm_large_memory_crop(visual_est_rgb, output_format):
+                            self.info_label.setText("JPEG crop cancelled before allocating the large RGB array.")
+                            return
+                elif visual_est_rgb > MAX_INTERACTIVE_CROP_BYTES:
+                    # TIFF/OME-TIFF has a chunked disk-backed path, so use it
+                    # automatically rather than forcing a giant RAM allocation.
+                    visual_lowmem = True
+                    self.info_label.setText(
+                        f"Large RGB crop detected ({_human_bytes(visual_est_rgb)}). "
+                        "Saving with low-memory tiled export..."
+                    )
+                    QApplication.processEvents()
+
+            self._set_crop_operation_active(True)
+            self.progress.setVisible(True)
+            self.progress.setRange(0, 0)
+            _raise_if_cancelled(self._crop_cancel_check)
+
             if preserve_raw:
-                roi, axes, _ = self.backend.crop_raw(x, y, w, h)
+                roi, axes, crop_raw_meta = self.backend.crop_raw(x, y, w, h)
+                _raise_if_cancelled(self._crop_cancel_check)
                 if raw_downsample != 1.0:
                     roi, axes = _resize_spatial_array(roi, axes, raw_downsample)
+                    _raise_if_cancelled(self._crop_cancel_check)
                 save_multichannel_image(
                     out_path, roi, axes=axes, write_ome=write_ome,
                     lossless=self.crop_lossless_chk.isChecked(),
@@ -13050,13 +14471,25 @@ class WSICropTileMergeGUI(QMainWindow):
                     source_mpp=self.backend.source_mpp,
                     image_name=out_path.stem,
                     pixel_scale=raw_downsample,
-                    pyramid_levels=pyramid_levels
+                    pyramid_levels=pyramid_levels,
+                    cancel_callback=self._crop_cancel_check,
                 )
+                _raise_if_cancelled(self._crop_cancel_check)
                 cal_text = f" | MPP inherited: {_format_mpp_text(self.backend.source_mpp)}" if self.backend.source_mpp else " | WARNING: source MPP unknown; output viewer may default to 1 µm/px"
                 pyramid_text = f" | pyramid_levels={_effective_pyramid_levels(roi.shape, axes, pyramid_levels)}" if pyramid_levels > 1 else ""
-                saved_text = f"Saved raw multichannel crop: {out_path} | shape={tuple(roi.shape)} | axes={axes or 'unknown'} | dtype={roi.dtype}{pyramid_text}{cal_text}"
+                saved_text = (
+                    f"Saved raw multichannel crop: {out_path} | shape={tuple(roi.shape)} | "
+                    f"axes={axes or 'unknown'} | dtype={roi.dtype}{pyramid_text}{cal_text}"
+                )
             else:
                 if visual_lowmem:
+                    def rgb_progress(done, total):
+                        self.info_label.setText(f"Saving large RGB crop by chunks: {done}/{total} blocks")
+                        self.progress.setVisible(True)
+                        self.progress.setRange(0, max(1, int(total)))
+                        self.progress.setValue(int(done))
+                        QApplication.processEvents()
+
                     result = save_rgb_crop_lowmem(
                         self.backend, out_path, x, y, w, h,
                         downsample=raw_downsample, output_format=output_format,
@@ -13065,11 +14498,12 @@ class WSICropTileMergeGUI(QMainWindow):
                         source_mpp=self.backend.source_mpp,
                         image_name=out_path.stem,
                         annotation_kv=self.backend.openslide_props if write_ome else None,
-                        progress_callback=lambda done, total: self.info_label.setText(
-                            f"Saving large RGB crop by chunks: {done}/{total} blocks"
-                        ),
+                        progress_callback=rgb_progress,
                         pyramid_levels=pyramid_levels,
+                        cancel_callback=self._crop_cancel_check,
                     )
+                    _raise_if_cancelled(self._crop_cancel_check)
+                    fallback_meta = result
                     cal_text = f" | MPP inherited: {_format_mpp_text(self.backend.source_mpp)}" if self.backend.source_mpp else " | WARNING: source MPP unknown; output viewer may default to 1 µm/px"
                     saved_text = (
                         f"Saved large RGB crop using low-memory tiled export: {out_path} | "
@@ -13077,7 +14511,10 @@ class WSICropTileMergeGUI(QMainWindow):
                         f"pyramid_levels={result.get('pyramid_levels', 1)}{cal_text}"
                     )
                 else:
-                    roi, crop_meta = _read_visual_crop_for_save(self.backend, x, y, w, h, downsample=raw_downsample)
+                    roi, crop_meta = _read_visual_crop_for_save(
+                        self.backend, x, y, w, h, downsample=raw_downsample
+                    )
+                    _raise_if_cancelled(self._crop_cancel_check)
                     if _is_safe_placeholder_meta(crop_meta):
                         raise RuntimeError(
                             "The crop reader returned a display placeholder instead of real pixels. "
@@ -13088,26 +14525,70 @@ class WSICropTileMergeGUI(QMainWindow):
                         self.backend.source_resolution, self.backend.source_mpp, out_path.stem,
                         self.backend.openslide_props if write_ome else None,
                         pixel_scale=raw_downsample,
-                        pyramid_levels=pyramid_levels
+                        pyramid_levels=pyramid_levels,
+                        cancel_callback=self._crop_cancel_check,
                     )
+                    _raise_if_cancelled(self._crop_cancel_check)
+                    fallback_meta = crop_meta
                     cal_text = f" | MPP inherited: {_format_mpp_text(self.backend.source_mpp)}" if self.backend.source_mpp else " | WARNING: source MPP unknown; output viewer may default to 1 µm/px"
                     reader_text = crop_meta.get("reader", self.backend.reader) if isinstance(crop_meta, dict) else self.backend.reader
                     pyramid_text = f" | pyramid_levels={_effective_pyramid_levels(roi.shape, 'YXS', pyramid_levels)}" if pyramid_levels > 1 else ""
-                    saved_text = f"Saved RGB crop: {out_path} | Reader: {reader_text} | output_shape={tuple(roi.shape)}{pyramid_text}{cal_text}"
+                    saved_text = (
+                        f"Saved RGB crop: {out_path} | Reader: {reader_text} | "
+                        f"output_shape={tuple(roi.shape)}{pyramid_text}{cal_text}"
+                    )
+
+            if output_format == "tiff":
+                saved_text += self._crop_output_size_note(
+                    out_path, pyramid_levels, self.crop_lossless_chk.isChecked()
+                )
 
             # Display a reduced preview instead of converting the full saved crop.
             if self.crop_preview_chk.isChecked():
                 try:
-                    arr, axes_p, meta = read_roi_region_from_backend(self.backend, (x, y, w, h), max_side=1000)
+                    arr, axes_p, meta = read_roi_region_from_backend(
+                        self.backend, (x, y, w, h), max_side=1000
+                    )
                     if not _is_safe_placeholder_meta(meta):
                         preview_rgb = _array_to_rgb_preview(arr, axes_p)
                         self._set_label_pixmap(self.crop_thumb_out, _downsample_for_preview(preview_rgb, 512))
                 except Exception:
                     pass
+
             self.info_label.setText(saved_text)
             QMessageBox.information(self, "Success", saved_text)
+            self._show_level0_recovery_warning(fallback_meta)
+
+        except CropCancelledError:
+            # tifffile/Pillow may have already created a partial destination.
+            # A cancelled operation must never leave it looking like a valid crop.
+            if out_path is not None:
+                try:
+                    Path(out_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            self.info_label.setText("Crop cancelled. Partial output and temporary files were removed.")
+            QMessageBox.information(
+                self,
+                "Crop cancelled",
+                "The crop operation was cancelled. Partial output and temporary files were removed."
+            )
         except Exception as e:
+            # Remove partial output produced by a failed save. Session temporaries
+            # are cleaned by each operation and again when the application closes.
+            if out_path is not None:
+                try:
+                    Path(out_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
             QMessageBox.critical(self, "Error", _exception_text(e))
+        finally:
+            self._set_crop_operation_active(False)
+            if self.active_worker is None or not self.active_worker.isRunning():
+                self.progress.setVisible(False)
+            if getattr(self, "_close_after_crop_cancel", False):
+                self._close_after_crop_cancel = False
+                QTimer.singleShot(0, self.close)
 
     # ========================================================
     # Tiles page
@@ -13632,7 +15113,7 @@ class WSICropTileMergeGUI(QMainWindow):
             arr = np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8)
             return arr, "YXS"
         with tifffile.TiffFile(str(path)) as tif:
-            s = tif.series[0]
+            _series_index, s = _select_primary_tiff_series(tif)
             axes = getattr(s, "axes", "") or ""
             arr = s.asarray()
         axes = _guess_axes_for_array(arr, axes)

@@ -2,7 +2,7 @@
 
 ### WSI Crop, Tile and Merge Tool for Digital Pathology Images
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20316535.svg)](https://doi.org/10.5281/zenodo.20316535)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21956932.svg)](https://doi.org/10.5281/zenodo.21956932)
 
 PathoImage Toolkit is a standalone application for working with large digital pathology and microscopy images. It supports high-resolution ROI cropping, fixed-size tiling, row/column-based image division, and reconstruction of tiled images.
 
@@ -17,6 +17,8 @@ The Windows release is designed to run without a separate Python installation. L
 - Crop high-resolution ROIs from large WSI files.
 - Select the full image area automatically for whole-slide export or downsampling.
 - Downsample crops before saving.
+- Batch-convert supported image files to OME-TIFF, TIFF, JPEG, or PNG, with optional downsampling and a selectable output folder.
+- Automatically raise JPEG downsample when required to keep each output axis within the safe JPEG encoder limit.
 - Generate fixed-size square tiles with optional overlap.
 - Divide images into a user-defined number of rows and columns.
 - Bulk tile multiple images with the same parameters.
@@ -84,6 +86,8 @@ On Windows, unsigned executables downloaded from GitHub may trigger a security w
 |---|---|---|
 | TIFF / pyramidal TIFF | tifffile / OpenSlide | Pyramid support when available |
 | OME-TIFF | tifffile / OpenSlide | Physical pixel size preserved when available |
+| QPTIFF | tifffile | Akoya/PerkinElmer TIFF-family images; primary full-resolution series selected automatically |
+| VSI | BFIO / Bio-Formats | Olympus/Evident cellSens; keep the `.vsi` with its associated ETS/data folder |
 | SVS | OpenSlide / tifffile fallback | Common digital pathology format |
 | NDPI | OpenSlide | Requires OpenSlide support |
 | MRXS | OpenSlide | The `.mrxs` file must remain beside its associated data folder |
@@ -105,6 +109,12 @@ On Windows, unsigned executables downloaded from GitHub may trigger a security w
    - `Crop`
    - `Tiles`
    - `Merge Tiles`
+   - `Split LIF`
+   - `Downsample`
+   - `Convert`
+   - `Image Preview`
+   - `IF Threshold Explorer`
+   - `Explorer`
 5. Load one or more images.
 6. Configure parameters.
 7. Preview when needed.
@@ -141,6 +151,39 @@ If original pixel size = 0.25 µm/px
 and crop downsample = 2
 then output pixel size = 0.50 µm/px
 ```
+
+---
+
+## Convert Mode
+
+Convert mode changes the file format of one image or a batch of images. It is intended for workflows such as VSI/QPTIFF/NDPI → TIFF/OME-TIFF, or large WSI → JPEG/PNG when a raster copy is needed.
+
+Options:
+
+- Select individual files or all supported files in one folder.
+- Choose an output folder; if left empty, each output is saved beside its input.
+- Output formats: OME-TIFF, TIFF, JPEG, or PNG.
+- Optional downsample. If disabled, the requested downsample is `1`.
+- Optional raw-channel preservation for TIFF/OME-TIFF when a safe scientific-data path is available.
+- Optional overwrite of existing outputs. The converter never overwrites the source file in place.
+
+### JPEG safety
+
+A single JPEG cannot exceed the encoder's supported dimensions. PathoImage Toolkit uses a conservative maximum of **65,500 pixels per axis**. If the requested downsample is too small, Convert mode automatically increases it to the minimum safe value for that file and records both the requested and effective downsample in the conversion CSV log.
+
+Example:
+
+```text
+Input: 71,092 × 8,160 px
+Requested DS: 1.00
+Effective JPEG DS: 1.09
+```
+
+For exact full-resolution preservation when JPEG is not possible, use TIFF/OME-TIFF instead.
+
+### VSI first use
+
+VSI files are read through BFIO/Bio-Formats. PathoImage Toolkit configures scyjava to use a **Zulu JDK 17**. The first VSI open on a computer may download the JDK and Bio-Formats/Maven runtime into the user's local cache, so an internet connection may be required the first time. Later uses reuse the cached runtime. Keep each `.vsi` together with its associated ETS/data folder.
 
 ---
 
@@ -376,7 +419,7 @@ Alternative using the spec file:
 pyinstaller --noconfirm --clean PathoImageToolkit.spec
 ```
 
-The build script/spec bundles required dependencies, including OpenSlide support and compiled imagecodecs components where configured.
+The build script/spec bundles the Python dependencies required by OpenSlide, imagecodecs, BFIO/scyjava and the other supported readers. A JDK is not embedded in the executable; VSI support provisions its Java/Bio-Formats runtime on first use.
 
 ---
 
@@ -430,7 +473,8 @@ assets/screenshots/
 - 8 GB RAM minimum.
 - 16 GB RAM or more recommended for large WSI.
 - Sufficient disk space for large crops, tile sets, or merged outputs.
-- No internet connection required after download.
+- No internet connection is required for standard formats after download.
+- First-time VSI use may require internet access so scyjava/cjdk can provision JDK 17 and Bio-Formats/Maven artifacts.
 
 ### Linux artifact
 
@@ -438,12 +482,14 @@ assets/screenshots/
 - OpenSlide-compatible system libraries.
 - Qt/XCB-related libraries required by PyQt5.
 - 8 GB RAM minimum; 16 GB or more recommended for large WSI.
+- First-time VSI use may require internet access to provision JDK 17 and Bio-Formats/Maven artifacts.
 
 ### macOS artifact
 
 - Recent macOS version.
 - OpenSlide support if working with WSI formats requiring OpenSlide.
 - 8 GB RAM minimum; 16 GB or more recommended for large WSI.
+- First-time VSI use may require internet access to provision JDK 17 and Bio-Formats/Maven artifacts.
 
 ### Development/building
 
@@ -464,6 +510,9 @@ This project depends on:
 - numcodecs
 - PyQt5
 - OpenSlide / openslide-python / openslide-bin
+- BFIO / Bio-Formats
+- scyjava / JPype / jgo / cjdk
+- readlif / Beautiful Soup / soupsieve
 - PyInstaller for building executables
 
 See `THIRD_PARTY_NOTICES.md` for additional information.
@@ -474,12 +523,12 @@ See `THIRD_PARTY_NOTICES.md` for additional information.
 
 If you use this software, please cite:
 
-Rodriguez-Rojas J. TiffCropper: WSI Crop, Tile and Merge Tool for Digital Pathology Images. Version 1.2. Zenodo; 2026. doi:10.5281/zenodo.20316535
+Rodriguez-Rojas J. PathoImage Toolkit: Digital Pathology and Microscopy Image Utility. Version 2.0.0. 2026. doi:10.5281/zenodo.21956932
 
 BibTeX-style plain entry:
 
 ```text
-Rodriguez-Rojas J. TiffCropper: WSI Crop, Tile and Merge Tool for Digital Pathology Images. Version 1.2. Zenodo; 2026. doi:10.5281/zenodo.20316535
+Rodriguez-Rojas J. PathoImage Toolkit: Digital Pathology and Microscopy Image Utility. Version 2.0.0. 2026. doi:10.5281/zenodo.21956932
 ```
 
 ---
