@@ -5324,6 +5324,7 @@ class ImageBackend:
         self._decoded_memmap_axes = None
         self._bio_reader = None
         self._bio_shape = None
+        self._bio_axes = None
         self._bio_dtype = None
         self._bio_channel_names = []
         self._bio_level_dims = None
@@ -5358,6 +5359,7 @@ class ImageBackend:
         self._decoded_memmap_axes = None
         self._bio_reader = None
         self._bio_shape = None
+        self._bio_axes = None
         self._bio_dtype = None
         self._bio_channel_names = []
         self._bio_level_dims = None
@@ -5644,6 +5646,142 @@ class ImageBackend:
             int(getattr(dims, "T", 1)),
         )
 
+    @staticmethod
+    def _bioio_samples(img) -> int:
+        """Return BioIO Samples-per-pixel (S), defaulting to 1."""
+        try:
+            return max(1, int(getattr(img.dims, "S", 1)))
+        except Exception:
+            return 1
+
+    @staticmethod
+    def _bioio_axes_order(img, data=None) -> str:
+        """Return BioIO's standardized axis order, including optional Samples.
+
+        BioIO normally exposes TCZYX, but RGB brightfield scenes can expose the
+        optional Samples axis and therefore arrive as TCZYXS.  VSI readers can
+        legitimately use either form, so the Toolkit must not hard-code 5D.
+        """
+        try:
+            order = str(getattr(img.dims, "order", "") or "")
+        except Exception:
+            order = ""
+        ndim = getattr(data, "ndim", None)
+        if order and (ndim is None or len(order) == int(ndim)):
+            return order
+        try:
+            xdims = tuple(str(x) for x in img.xarray_dask_data.dims)
+            order = "".join(xdims)
+            if order and (ndim is None or len(order) == int(ndim)):
+                return order
+        except Exception:
+            pass
+        if ndim is not None:
+            shape = tuple(getattr(data, "shape", ()) or ())
+            if int(ndim) == 6 and shape and int(shape[-1]) in (3, 4):
+                return "TCZYXS"
+            if int(ndim) == 5:
+                return "TCZYX"
+            if int(ndim) == 4:
+                return "CZYX"
+            if int(ndim) == 3 and shape and int(shape[-1]) in (3, 4):
+                return "YXS"
+            if int(ndim) == 3:
+                return "CYX"
+            if int(ndim) == 2:
+                return "YX"
+        return ""
+
+    @classmethod
+    def _bioio_read_region(cls, img, x: int, y: int, w: int, h: int,
+                           preserve_nonspatial: bool = False):
+        """Read one BioIO region without assuming TCZYX versus TCZYXS.
+
+        For display reads, T/Z/other non-spatial dimensions are fixed at index 0
+        while C and optional S are retained.  Raw reads preserve all dimensions.
+        """
+        data = img.dask_data
+        axes = cls._bioio_axes_order(img, data)
+        if not axes or len(axes) != int(data.ndim) or "Y" not in axes or "X" not in axes:
+            raise RuntimeError(
+                f"Could not determine BioIO axis order for VSI data: "
+                f"shape={tuple(data.shape)}, axes={axes or 'unknown'}"
+            )
+        slicer = []
+        kept = []
+        for ax in axes:
+            if ax == "Y":
+                slicer.append(slice(int(y), int(y + h)))
+                kept.append(ax)
+            elif ax == "X":
+                slicer.append(slice(int(x), int(x + w)))
+                kept.append(ax)
+            elif preserve_nonspatial:
+                slicer.append(slice(None))
+                kept.append(ax)
+            elif ax in ("C", "S"):
+                slicer.append(slice(None))
+                kept.append(ax)
+            else:
+                # Display uses the first T/Z/M/etc. plane only.
+                slicer.append(0)
+        arr = np.asarray(data[tuple(slicer)].compute())
+        return arr, "".join(kept)
+
+    @staticmethod
+    def _bioio_display_array(arr: np.ndarray, axes: str) -> Tuple[np.ndarray, str]:
+        """Convert a BioIO display read to YX, YXC, or YXS.
+
+        RGB VSI brightfield data commonly arrive as CYXS with C=1 and S=3.
+        The previous code interpreted every 3D result as CYX; that is what caused
+        the 6D TCZYXS VSI failure.
+        """
+        arr = np.asarray(arr)
+        axes = str(axes or "")
+        if not axes or len(axes) != arr.ndim:
+            squeezed = np.squeeze(arr)
+            return squeezed, _guess_axes_for_array(squeezed)
+
+        # A Samples axis of 3/4 is true interleaved RGB/RGBA.  If a singleton C
+        # axis is also present, remove it; if several C planes exist, display the
+        # first C plane while raw export still preserves every dimension.
+        if "S" in axes:
+            s_axis = axes.index("S")
+            try:
+                s_size = int(arr.shape[s_axis])
+            except Exception:
+                s_size = 0
+            if s_size in (3, 4):
+                if "C" in axes:
+                    c_axis = axes.index("C")
+                    arr = np.take(arr, 0, axis=c_axis)
+                    axes = axes[:c_axis] + axes[c_axis + 1:]
+                # Drop any remaining singleton non-spatial axes defensively.
+                for ax in list(axes):
+                    if ax not in ("Y", "X", "S"):
+                        i = axes.index(ax)
+                        arr = np.take(arr, 0, axis=i)
+                        axes = axes[:i] + axes[i + 1:]
+                order = [axes.index("Y"), axes.index("X"), axes.index("S")]
+                return np.transpose(arr, order), "YXS"
+
+        # Multichannel scientific data: retain C and put it last for display.
+        keep = [ax for ax in ("Y", "X", "C") if ax in axes]
+        for ax in list(axes):
+            if ax not in keep:
+                i = axes.index(ax)
+                arr = np.take(arr, 0, axis=i)
+                axes = axes[:i] + axes[i + 1:]
+        if "Y" in axes and "X" in axes:
+            order = [axes.index("Y"), axes.index("X")]
+            out_axes = "YX"
+            if "C" in axes:
+                order.append(axes.index("C"))
+                out_axes += "C"
+            return np.transpose(arr, order), out_axes
+        squeezed = np.squeeze(arr)
+        return squeezed, _guess_axes_for_array(squeezed)
+
     def _new_bioreader(self, level: int = 0, scene_index: Optional[int] = None):
         """Open a BioIO Bio-Formats reader for the selected VSI scene."""
         imported = _try_import_bioio_bioformats()
@@ -5692,7 +5830,9 @@ class ImageBackend:
         if self._bio_reader is None:
             self._bio_reader = self._new_bioreader(level=0)
             w, h, c, z, t = self._bioio_scene_dims(self._bio_reader)
-            self._bio_shape = (t, c, z, h, w)
+            data = self._bio_reader.dask_data
+            self._bio_shape = tuple(int(v) for v in data.shape)
+            self._bio_axes = self._bioio_axes_order(self._bio_reader, data)
             try:
                 self._bio_dtype = np.dtype(self._bio_reader.dtype)
             except Exception:
@@ -5717,6 +5857,7 @@ class ImageBackend:
                 try:
                     img.set_scene(index)
                     w, h, c, z, t = self._bioio_scene_dims(img)
+                    samples = self._bioio_samples(img)
                     dtype_text = str(np.dtype(img.dtype))
                     levels = list(getattr(img, "resolution_levels", ()) or ())
                 except Exception as exc:
@@ -5726,6 +5867,7 @@ class ImageBackend:
                         "width": 0,
                         "height": 0,
                         "channels": 0,
+                        "samples": 0,
                         "z": 0,
                         "t": 0,
                         "dtype": "unknown",
@@ -5741,6 +5883,7 @@ class ImageBackend:
                     "width": int(w),
                     "height": int(h),
                     "channels": int(c),
+                    "samples": int(samples),
                     "z": int(z),
                     "t": int(t),
                     "dtype": dtype_text,
@@ -5784,14 +5927,19 @@ class ImageBackend:
             psx = psy = None
         self.source_mpp = (psx, psy) if psx and psy and psx > 0 and psy > 0 else None
         self.source_resolution = _mpp_to_resolution_tuple(psx, psy) if self.source_mpp else None
+        bio_data = br.dask_data
+        bio_axes = self._bioio_axes_order(br, bio_data)
+        samples = self._bioio_samples(br)
         self.openslide_props = {
             "bioformats.reader": "BioIO/Bio-Formats",
             "bioformats.scene_index": str(scene_index),
             "bioformats.scene_name": self._vsi_scene_name,
             "bioformats.scene_count": str(len(self._vsi_scenes)),
-            "bioformats.shape_tczyx": str((t, c, z, h, w)),
+            "bioformats.axes": str(bio_axes),
+            "bioformats.shape": str(tuple(int(v) for v in bio_data.shape)),
             "bioformats.dtype": str(np.dtype(br.dtype)),
             "bioformats.channels": str(c),
+            "bioformats.samples": str(samples),
             "bioformats.z": str(z),
             "bioformats.t": str(t),
         }
@@ -5856,31 +6004,20 @@ class ImageBackend:
                     img.set_resolution_level(int(levels[-1]))
                 except Exception:
                     pass
-            data = img.dask_data
-            # BioIO standard order is TCZYX. Read first T/Z and all channels.
-            raw = np.asarray(data[0, :, 0, :, :].compute())
-            if raw.ndim == 3:
-                arr = np.moveaxis(raw, 0, -1)
-                axes = "YXC"
-            elif raw.ndim == 2:
-                arr, axes = raw, "YX"
-            else:
-                arr, axes = np.squeeze(raw), _guess_axes_for_array(np.squeeze(raw))
+            level_w, level_h, _c, _z, _t = self._bioio_scene_dims(img)
+            raw, raw_axes = self._bioio_read_region(
+                img, 0, 0, int(level_w), int(level_h), preserve_nonspatial=False
+            )
+            arr, axes = self._bioio_display_array(raw, raw_axes)
             rgb = _array_to_rgb_preview(arr, axes)
             return _downsample_for_preview(rgb, max_side=max_side)
         finally:
             self._dispose_bioio(img)
 
     @staticmethod
-    def _bioformats_yxc_from_read(arr: np.ndarray) -> Tuple[np.ndarray, str]:
-        """Convert BioIO C,Y,X (or Y,X) data to display YX/YXC."""
-        arr = np.asarray(arr)
-        if arr.ndim == 3:
-            return np.moveaxis(arr, 0, -1), "YXC"
-        arr = np.squeeze(arr)
-        if arr.ndim == 2:
-            return arr, "YX"
-        return arr, _guess_axes_for_array(arr)
+    def _bioformats_yxc_from_read(arr: np.ndarray, axes: str = "CYX") -> Tuple[np.ndarray, str]:
+        """Backward-compatible wrapper for BioIO display conversion."""
+        return ImageBackend._bioio_display_array(arr, axes)
 
     def _bioformats_level_dimensions(self, max_levels: int = 12) -> List[Tuple[int, int, int]]:
         """Discover usable resolution levels for the selected VSI scene."""
@@ -5938,9 +6075,10 @@ class ImageBackend:
         current = getattr(img, "current_resolution_level", 0)
         try:
             img.set_resolution_level(int(level))
-            data = img.dask_data  # TCZYX
-            raw = np.asarray(data[0, :, 0, ly0:ly1, lx0:lx1].compute())
-            arr, axes = self._bioformats_yxc_from_read(raw)
+            raw, raw_axes = self._bioio_read_region(
+                img, lx0, ly0, lx1 - lx0, ly1 - ly0, preserve_nonspatial=False
+            )
+            arr, axes = self._bioio_display_array(raw, raw_axes)
             rgb = _array_to_rgb_preview(arr, axes)
             rgb = _downsample_for_preview(rgb, max_side=max_side)
             ds = max(float(full_w) / max(1.0, float(level_w)), float(full_h) / max(1.0, float(level_h)))
@@ -5967,9 +6105,10 @@ class ImageBackend:
         current = getattr(img, "current_resolution_level", 0)
         try:
             img.set_resolution_level(0)
-            data = img.dask_data
-            raw = np.asarray(data[0, :, 0, int(y):int(y + h), int(x):int(x + w)].compute())
-            arr, axes = self._bioformats_yxc_from_read(raw)
+            raw, raw_axes = self._bioio_read_region(
+                img, int(x), int(y), int(w), int(h), preserve_nonspatial=False
+            )
+            arr, axes = self._bioio_display_array(raw, raw_axes)
             return _array_to_rgb_preview(arr, axes), {
                 "used": False,
                 "reader": "bioio-bioformats-vsi-level0",
@@ -5983,19 +6122,27 @@ class ImageBackend:
                 pass
 
     def _crop_bioformats_raw(self, x: int, y: int, w: int, h: int):
-        """Read a full-fidelity VSI ROI as TCZYX without display normalization."""
+        """Read a full-fidelity VSI ROI, preserving optional BioIO Samples (S).
+
+        BioIO standardizes ordinary microscopy data as TCZYX, but RGB brightfield
+        VSI scenes can be TCZYXS (for example 1×1×1×Y×X×3).  Preserve the actual
+        axis order instead of rejecting valid six-dimensional RGB data.
+        """
         img = self._get_bioreader()
         current = getattr(img, "current_resolution_level", 0)
         try:
             img.set_resolution_level(0)
-            data = img.dask_data  # standardized TCZYX
-            arr = np.asarray(data[:, :, :, int(y):int(y + h), int(x):int(x + w)].compute())
-            if arr.ndim != 5:
-                raise RuntimeError(f"Unexpected BioIO VSI array shape: {arr.shape}")
-            return np.ascontiguousarray(arr), "TCZYX", {
+            arr, axes = self._bioio_read_region(
+                img, int(x), int(y), int(w), int(h), preserve_nonspatial=True
+            )
+            if not axes or len(axes) != arr.ndim or "Y" not in axes or "X" not in axes:
+                raise RuntimeError(
+                    f"Unexpected BioIO VSI axis layout: shape={arr.shape}, axes={axes or 'unknown'}"
+                )
+            return np.ascontiguousarray(arr), axes, {
                 "used": False,
                 "reader": "bioio-bioformats-vsi-level0-raw",
-                "source_axes": "TCZYX",
+                "source_axes": axes,
                 "scene_index": int(self._vsi_scene_index),
                 "scene_name": self._vsi_scene_name,
             }
@@ -14263,8 +14410,14 @@ class WSICropTileMergeGUI(QMainWindow):
         w = int(info.get("width", 0) or 0)
         h = int(info.get("height", 0) or 0)
         c = int(info.get("channels", 0) or 0)
+        samples = int(info.get("samples", 1) or 1)
         role = "Auxiliary" if info.get("auxiliary", False) else "Main-image candidate"
-        return f"{name}\n{w:,} × {h:,} px  •  {c} channel(s)  •  {role}"
+        pixel_text = f"{c} channel(s)"
+        if samples in (3, 4):
+            pixel_text += f" • RGB{'A' if samples == 4 else ''} samples={samples}"
+        elif samples > 1:
+            pixel_text += f" • samples={samples}"
+        return f"{name}\n{w:,} × {h:,} px  •  {pixel_text}  •  {role}"
 
     def choose_crop_vsi_scene(self, force_dialog: bool = True):
         """Show all internal VSI scenes with thumbnails and switch the active scene."""
