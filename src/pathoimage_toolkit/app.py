@@ -230,7 +230,14 @@ def _try_import_bfio():
         from bfio import BioReader
         return BioReader
     except Exception as exc:
-        _BFIO_IMPORT_ERROR = f"Could not import bfio.BioReader: {type(exc).__name__}: {exc}"
+        detail = f"Could not import bfio.BioReader: {type(exc).__name__}: {exc}"
+        if "xsdata_pydantic_basemodel" in str(exc):
+            detail += (
+                "\nThe frozen application is missing ome-types' dynamically imported "
+                "xsdata_pydantic_basemodel package. Rebuild with the updated "
+                "PathoImageToolkit.spec that explicitly collects this package."
+            )
+        _BFIO_IMPORT_ERROR = detail
         return None
 
 

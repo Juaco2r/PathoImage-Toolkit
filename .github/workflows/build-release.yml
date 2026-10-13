@@ -70,7 +70,7 @@ jobs:
       # -----------------------------
       - name: Check image and VSI dependencies
         run: |
-          python -c "import imagecodecs, zarr, bfio, scyjava, jpype; print('imagecodecs:', imagecodecs.version()); print('zarr:', zarr.__version__); print('bfio:', bfio.__version__); print('scyjava import: OK'); print('jpype import: OK')"
+          python -c "import imagecodecs, zarr, bfio, scyjava, jpype, xsdata_pydantic_basemodel.hooks; print('imagecodecs:', imagecodecs.version()); print('zarr:', zarr.__version__); print('bfio:', bfio.__version__); print('scyjava import: OK'); print('jpype import: OK'); print('OME/xsdata hooks: OK')"
           python -c "from importlib.metadata import version; print('bfio metadata:', version('bfio')); print('scyjava metadata:', version('scyjava')); print('JPype1 metadata:', version('JPype1'))"
 
       # -----------------------------
@@ -96,6 +96,11 @@ jobs:
             --collect-all bfio \
             --collect-all bfiocpp \
             --collect-all ome_types \
+            --collect-all xsdata_pydantic_basemodel \
+            --collect-all xsdata \
+            --collect-all pydantic \
+            --collect-all pydantic_core \
+            --collect-all pydantic_extra_types \
             --collect-all scyjava \
             --collect-all jpype \
             --collect-all jgo \
@@ -106,6 +111,9 @@ jobs:
             --copy-metadata cjdk \
             --copy-metadata JPype1 \
             --copy-metadata ome-types \
+            --copy-metadata xsdata \
+            --copy-metadata pydantic \
+            --copy-metadata pydantic-extra-types \
             --copy-metadata bfiocpp \
             --collect-all readlif \
             --collect-all bs4 \
@@ -129,6 +137,11 @@ jobs:
             --collect-all bfio \
             --collect-all bfiocpp \
             --collect-all ome_types \
+            --collect-all xsdata_pydantic_basemodel \
+            --collect-all xsdata \
+            --collect-all pydantic \
+            --collect-all pydantic_core \
+            --collect-all pydantic_extra_types \
             --collect-all scyjava \
             --collect-all jpype \
             --collect-all jgo \
@@ -139,6 +152,9 @@ jobs:
             --copy-metadata cjdk \
             --copy-metadata JPype1 \
             --copy-metadata ome-types \
+            --copy-metadata xsdata \
+            --copy-metadata pydantic \
+            --copy-metadata pydantic-extra-types \
             --copy-metadata bfiocpp \
             --collect-all readlif \
             --collect-all bs4 \

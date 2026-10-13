@@ -30,7 +30,23 @@ zarr_datas, zarr_binaries, zarr_hiddenimports = collect_all("zarr")
 
 # Olympus/Evident VSI support. BFIO uses dynamic imports, JPype, scyjava/jgo,
 # cjdk and a compiled bfiocpp extension, so collect them explicitly.
-vsi_packages = ("bfio", "bfiocpp", "ome_types", "scyjava", "jpype", "jgo", "cjdk")
+vsi_packages = (
+    "bfio",
+    "bfiocpp",
+    "ome_types",
+    # ome-types 0.6.x ships additional top-level packages that are imported
+    # dynamically through xsdata hooks. They are siblings of ome_types, so
+    # collecting ome_types alone does not make PyInstaller include them.
+    "xsdata_pydantic_basemodel",
+    "xsdata",
+    "pydantic",
+    "pydantic_core",
+    "pydantic_extra_types",
+    "scyjava",
+    "jpype",
+    "jgo",
+    "cjdk",
+)
 vsi_datas = []
 vsi_binaries = []
 vsi_hiddenimports = []
@@ -45,7 +61,10 @@ for package_name in vsi_packages:
 # distributions at runtime, so preserve the metadata explicitly. Recursive BFIO
 # metadata also covers its declared dependencies.
 vsi_metadata = []
-for distribution_name in ("bfio", "scyjava", "jgo", "cjdk", "JPype1", "ome-types", "bfiocpp"):
+for distribution_name in (
+    "bfio", "scyjava", "jgo", "cjdk", "JPype1", "ome-types", "bfiocpp",
+    "xsdata", "pydantic", "pydantic-extra-types"
+):
     try:
         vsi_metadata += copy_metadata(distribution_name, recursive=(distribution_name == "bfio"))
     except Exception:
@@ -117,6 +136,12 @@ hiddenimports = [
     "bfio",
     "bfiocpp",
     "ome_types",
+    "xsdata_pydantic_basemodel",
+    "xsdata_pydantic_basemodel.hooks",
+    "xsdata",
+    "pydantic",
+    "pydantic_core",
+    "pydantic_extra_types",
     "scyjava",
     "jpype",
     "jgo",
